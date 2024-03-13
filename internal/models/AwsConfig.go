@@ -8,6 +8,7 @@ type AwsConfig struct {
 	KeySecret     string `yaml:"KeySecret"`
 	Endpoint      string `yaml:"Endpoint"`
 	ProxyDownload bool   `yaml:"ProxyDownload"`
+	Expiration 	  int    `yaml:"Expiration"`
 }
 
 // IsAllProvided returns true if all required variables have been set for using AWS S3 / Backblaze
@@ -15,5 +16,6 @@ func (c *AwsConfig) IsAllProvided() bool {
 	return c.Bucket != "" &&
 		c.Region != "" &&
 		c.KeyId != "" &&
-		c.KeySecret != ""
+		c.KeySecret != "" &&
+		c.Expiration != 0
 }

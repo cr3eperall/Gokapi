@@ -14,6 +14,7 @@ func TestIsAwsProvided(t *testing.T) {
 		Endpoint:  "",
 		KeyId:     "test",
 		KeySecret: "test",
+		Expiration: 15,
 	}
 	test.IsEqualBool(t, config.IsAllProvided(), true)
 }

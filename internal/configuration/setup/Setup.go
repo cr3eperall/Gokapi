@@ -588,6 +588,10 @@ func getCloudConfig(formObjects *[]jsonFormObject) (*cloudconfig.CloudConfig, er
 	if err != nil {
 		return nil, err
 	}
+	awsConfig.Aws.Expiration, err = getFormValueInt(formObjects, "s3_expiration")
+	if err != nil {
+		return nil, err
+	}
 	return &awsConfig, nil
 }
 
@@ -846,14 +850,15 @@ func verifyPortNumber(port int) int {
 }
 
 type testAwsRequest struct {
-	Bucket        string `json:"bucket"`
-	Region        string `json:"region"`
-	ApiKey        string `json:"apikey"`
-	ApiSecret     string `json:"apisecret"`
-	Endpoint      string `json:"endpoint"`
-	GokapiUrl     string `json:"exturl"`
-	SetupPassword string `json:"setupPassword"`
-	EnvProvided   bool   `json:"isEnvProvided"`
+	Bucket         string `json:"bucket"`
+	Region         string `json:"region"`
+	ApiKey         string `json:"apikey"`
+	ApiSecret      string `json:"apisecret"`
+	Endpoint       string `json:"endpoint"`
+	GokapiUrl      string `json:"exturl"`
+	SetupPassword  string `json:"setupPassword"`
+	EnvProvided    bool   `json:"isEnvProvided"`
+	Expiration     int    `json:"expiration"`
 }
 
 type awsTestResponse struct {
@@ -890,11 +895,12 @@ func handleTestAws(w http.ResponseWriter, r *http.Request) {
 
 	if !t.EnvProvided {
 		awsConfig = models.AwsConfig{
-			Bucket:    t.Bucket,
-			Region:    t.Region,
-			KeyId:     t.ApiKey,
-			KeySecret: t.ApiSecret,
-			Endpoint:  t.Endpoint,
+			Bucket:     t.Bucket,
+			Region:     t.Region,
+			KeyId:      t.ApiKey,
+			KeySecret:  t.ApiSecret,
+			Endpoint:   t.Endpoint,
+			Expiration: t.Expiration,
 		}
 	} else {
 		env := environment.New()
@@ -904,6 +910,7 @@ func handleTestAws(w http.ResponseWriter, r *http.Request) {
 			KeyId:     env.AwsKeyId,
 			KeySecret: env.AwsKeySecret,
 			Endpoint:  env.AwsEndpoint,
+			Expiration: env.AwsExpiration,
 		}
 	}
 	ok, err := aws.IsValidLogin(awsConfig)

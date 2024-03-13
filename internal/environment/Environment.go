@@ -91,6 +91,8 @@ type Environment struct {
 	AwsKeySecret string `env:"AWS_KEY_SECRET"`
 	// Sets the AWS endpoint
 	AwsEndpoint string `env:"AWS_ENDPOINT"`
+	// Sets the AWS link expiration time in seconds
+	AwsExpiration int 	 `env:"AWS_EXPIRATION" envDefault:"15"`
 	// Proxies downloads through the server instead of redirecting to pre-signed S3 URLs, if set to true
 	AwsProxyDownload bool `env:"AWS_PROXY_DOWNLOAD" envDefault:"false"`
 	// List of active deprecations

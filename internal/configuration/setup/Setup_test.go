@@ -422,6 +422,7 @@ func TestIntegration(t *testing.T) {
 		test.IsEqualString(t, cconfig.Aws.KeySecret, "testsecret")
 		test.IsEqualString(t, cconfig.Aws.Endpoint, "testendpoint")
 		test.IsEqualBool(t, cconfig.Aws.ProxyDownload, true)
+		test.IsEqualInt(t, cconfig.Aws.Expiration, 150)
 	}
 	test.FileExists(t, "test/cloudconfig.yml")
 
@@ -557,6 +558,7 @@ type setupValues struct {
 	S3ApiKey                      setupEntry `form:"s3_api"`
 	S3ApiSecret                   setupEntry `form:"s3_secret"`
 	S3Endpoint                    setupEntry `form:"s3_endpoint"`
+	S3Expiration 		          setupEntry `form:"s3_expiration"`
 	EncryptionLevel               setupEntry `form:"encrypt_sel" isInt:"true"`
 	EncryptionPassword            setupEntry `form:"enc_pw"`
 	DatabaseType                  setupEntry `form:"dbtype_sel" isInt:"true"`
@@ -676,6 +678,7 @@ func createInputInternalAuth() setupValues {
 	values.S3ApiKey.Value = "testapi"
 	values.S3ApiSecret.Value = "testsecret"
 	values.S3Endpoint.Value = "testendpoint"
+	values.S3Expiration.Value = "150"
 	values.EncryptionLevel.Value = "0"
 	values.PicturesAlwaysLocal.Value = "nochange"
 	values.SaveIp.Value = "0"

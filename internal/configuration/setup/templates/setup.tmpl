@@ -471,10 +471,14 @@
 								<input type="text" class="form-control" id="s3_secret" name="s3_secret" placeholder="API Key Secret" required data-min="1" data-validate="validateMinLength">
 							</div><br><br>
 							<div class="col-sm-8">
+								<label for="s3_expiration">Link expiration(Seconds):</label>
+								  <input type="number" class="form-control" id="s3_expiration" name="s3_expiration" placeholder="Expiration (Default: 15s)">
+							</div><br><br>
+							<div class="col-sm-8">
 							  <label for="s3_endpoint">Endpoint:</label>
 								<input type="text" class="form-control" id="s3_endpoint" name="s3_endpoint" placeholder="Endpoint (leave blank if AWS S3)">
-							<br><br>			  
-	  						 <button id="downloadbutton" class="btn btn-light" type="button" onclick="TestAWS(this, true);">
+							<br><br>
+	  						 <button id="downloadbutton" class="btn btn-light" type="button" onclick="TestAWS(this);">
 			  					Test configuration
 			  				</button>	
 {{ else }}
@@ -488,6 +492,7 @@
 			  				<input type="hidden" id="s3_api" name="s3_api">
 			  				<input type="hidden" id="s3_secret" name="s3_secret">
 			  				<input type="hidden" id="s3_endpoint" name="s3_endpoint">
+			  				<input type="hidden" id="s3_expiration" name="s3_expiration">
 {{ end }}			
 							</div>
 						</div>
@@ -554,7 +559,8 @@ function TestAWS(button, isManual) {
             apisecret: document.getElementById("s3_secret").value,
             endpoint: document.getElementById("s3_endpoint").value,
             setupPassword: sessionStorage.getItem("awstestpw"),
-            isEnvProvided: false
+            isEnvProvided: false,
+			expiration: document.getElementById("s3_expiration").value
         }));
     } else {
         xhr.send(JSON.stringify({

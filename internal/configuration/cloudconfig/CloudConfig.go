@@ -71,6 +71,7 @@ func loadFromEnv(env *environment.Environment) CloudConfig {
 		KeyId:         env.AwsKeyId,
 		KeySecret:     env.AwsKeySecret,
 		ProxyDownload: env.AwsProxyDownload,
+		Expiration:    env.AwsExpiration,
 	}}
 }
 
