@@ -138,7 +138,7 @@ func RedirectToDownload(w http.ResponseWriter, r *http.Request, file models.File
 		ResponseContentType:        aws.String(file.ContentType),
 	})
 
-	url, err := req.Presign(15 * time.Second)
+	url, err := req.Presign(time.Duration(awsConfig.Expiration) * time.Second)
 	if err != nil {
 		return err
 	}

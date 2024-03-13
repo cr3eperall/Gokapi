@@ -465,6 +465,10 @@ func getCloudConfig(formObjects *[]jsonFormObject) (*cloudconfig.CloudConfig, er
 	if err != nil {
 		return nil, err
 	}
+	awsConfig.Aws.Expiration, err = getFormValueInt(formObjects, "s3_expiration")
+	if err != nil {
+		return nil, err
+	}
 	return &awsConfig, nil
 }
 
@@ -675,12 +679,13 @@ func verifyPortNumber(port int) int {
 }
 
 type testAwsRequest struct {
-	Bucket    string `json:"bucket"`
-	Region    string `json:"region"`
-	ApiKey    string `json:"apikey"`
-	ApiSecret string `json:"apisecret"`
-	Endpoint  string `json:"endpoint"`
-	GokapiUrl string `json:"exturl"`
+	Bucket     string `json:"bucket"`
+	Region     string `json:"region"`
+	ApiKey     string `json:"apikey"`
+	ApiSecret  string `json:"apisecret"`
+	Endpoint   string `json:"endpoint"`
+	GokapiUrl  string `json:"exturl"`
+	Expiration int    `json:"expiration"`
 }
 
 // Handling of /testaws
@@ -698,6 +703,7 @@ func handleTestAws(w http.ResponseWriter, r *http.Request) {
 		KeyId:     t.ApiKey,
 		KeySecret: t.ApiSecret,
 		Endpoint:  t.Endpoint,
+		Expiration: t.Expiration,
 	}
 	ok, err := aws.IsValidLogin(awsconfig)
 	if err != nil {

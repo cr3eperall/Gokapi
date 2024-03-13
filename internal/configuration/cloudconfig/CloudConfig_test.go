@@ -34,6 +34,7 @@ func TestLoad(t *testing.T) {
 		Endpoint:  "",
 		KeyId:     "test",
 		KeySecret: "test",
+		Expiration: 15,
 	}, true)
 	os.Unsetenv("GOKAPI_AWS_BUCKET")
 	config, ok = Load()

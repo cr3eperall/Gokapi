@@ -27,6 +27,7 @@ type Environment struct {
 	AwsKeyId      string `env:"AWS_KEY"`
 	AwsKeySecret  string `env:"AWS_KEY_SECRET"`
 	AwsEndpoint   string `env:"AWS_ENDPOINT"`
+	AwsExpiration int 	 `env:"AWS_EXPIRATION" envDefault:"15"`
 	DatabaseName  string `env:"DB_NAME" envDefault:"gokapi.sqlite"`
 	// Deprecated: will be removed with 1.9
 	LegacyDbPath string
