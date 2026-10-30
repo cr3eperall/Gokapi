@@ -1,14 +1,15 @@
 package logging
 
 import (
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/forceu/gokapi/internal/test"
-	"github.com/forceu/gokapi/internal/test/testconfiguration"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/test"
+	"github.com/forceu/gokapi/internal/test/testconfiguration"
 )
 
 func TestMain(m *testing.M) {
@@ -19,17 +20,29 @@ func TestMain(m *testing.M) {
 }
 
 func TestGetIpAddress(t *testing.T) {
+	Init("test")
 	r := httptest.NewRequest("GET", "/test", nil)
-	test.IsEqualString(t, getIpAddress(r), "192.0.2.1")
+	test.IsEqualString(t, GetIpAddress(r), "192.0.2.1")
 	r = httptest.NewRequest("GET", "/test", nil)
 	r.RemoteAddr = "127.0.0.1:1234"
-	test.IsEqualString(t, getIpAddress(r), "127.0.0.1")
+	test.IsEqualString(t, GetIpAddress(r), "127.0.0.1")
 	r.RemoteAddr = "invalid"
-	test.IsEqualString(t, getIpAddress(r), "Unknown IP")
+	test.IsEqualString(t, GetIpAddress(r), "invalid")
+	r.Header.Add("X-REAL-IP", "invalid")
+	test.IsEqualString(t, GetIpAddress(r), "invalid")
+	r.Header.Add("X-FORWARDED-FOR", "invalid")
+	test.IsEqualString(t, GetIpAddress(r), "invalid")
+	r.RemoteAddr = "127.0.0.1"
+	r.Header.Del("X-REAL-IP")
+	r.Header.Del("X-FORWARDED-FOR")
+	test.IsEqualString(t, GetIpAddress(r), "127.0.0.1")
 	r.Header.Add("X-REAL-IP", "1.1.1.1")
-	test.IsEqualString(t, getIpAddress(r), "1.1.1.1")
-	r.Header.Add("X-FORWARDED-FOR", "1.1.1.2")
-	test.IsEqualString(t, getIpAddress(r), "1.1.1.2")
+	test.IsEqualString(t, GetIpAddress(r), "1.1.1.1")
+	r.Header.Add("X-FORWARDED-FOR", "1.1.1.1, 2.2.2.2")
+	test.IsEqualString(t, GetIpAddress(r), "2.2.2.2")
+	useCloudflare = true
+	r.Header.Add("CF-Connecting-IP", "3.3.3.3")
+	test.IsEqualString(t, GetIpAddress(r), "3.3.3.3")
 }
 
 func TestInit(t *testing.T) {
@@ -39,12 +52,10 @@ func TestInit(t *testing.T) {
 
 func TestAddString(t *testing.T) {
 	test.FileDoesNotExist(t, "test/log.txt")
-	AddString("Hello")
-	// Need sleep, as AddString() is non-blocking
-	time.Sleep(500 * time.Millisecond)
+	createLogEntry(categoryInfo, "Hello", true)
 	test.FileExists(t, "test/log.txt")
 	content, _ := os.ReadFile("test/log.txt")
-	test.IsEqualBool(t, strings.Contains(string(content), "UTC   Hello"), true)
+	test.IsEqualBool(t, strings.Contains(string(content), "UTC   [info] Hello"), true)
 }
 
 func TestAddDownload(t *testing.T) {
@@ -53,21 +64,18 @@ func TestAddDownload(t *testing.T) {
 		Name: "testName",
 	}
 	r := httptest.NewRequest("GET", "/test", nil)
+	r.RemoteAddr = "127.0.0.1"
 	r.Header.Set("User-Agent", "testAgent")
 	r.Header.Add("X-REAL-IP", "1.1.1.1")
-	AddDownload(&file, r, true)
-	// Need sleep, as AddDownload() is non-blocking
+	LogDownload(file, r, true)
+	// Need sleep, as LogDownload() is non-blocking
 	time.Sleep(500 * time.Millisecond)
 	content, _ := os.ReadFile("test/log.txt")
-	test.IsEqualBool(t, strings.Contains(string(content), "UTC   Download: Filename testName, IP 1.1.1.1, ID testId, Useragent testAgent"), true)
+	test.IsEqualBool(t, strings.Contains(string(content), "UTC   [download] testName, IP 1.1.1.1, ID testId, Useragent testAgent"), true)
 	r.Header.Add("X-REAL-IP", "2.2.2.2")
-	AddDownload(&file, r, false)
-	// Need sleep, as AddDownload() is non-blocking
+	LogDownload(file, r, false)
+	// Need sleep, as LogDownload() is non-blocking
 	time.Sleep(500 * time.Millisecond)
 	content, _ = os.ReadFile("test/log.txt")
 	test.IsEqualBool(t, strings.Contains(string(content), "2.2.2.2"), false)
-}
-
-func TestGetLogPath(t *testing.T) {
-	test.IsEqualString(t, GetLogPath(), "test/log.txt")
 }

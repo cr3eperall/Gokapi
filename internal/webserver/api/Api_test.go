@@ -3,180 +3,1328 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/configuration/database"
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/forceu/gokapi/internal/storage/processingstatus"
-	"github.com/forceu/gokapi/internal/test"
-	"github.com/forceu/gokapi/internal/test/testconfiguration"
-	"github.com/forceu/gokapi/internal/webserver/authentication"
-	"github.com/r3labs/sse/v2"
 	"io"
 	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/configuration/database"
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/storage"
+	"github.com/forceu/gokapi/internal/test"
+	"github.com/forceu/gokapi/internal/test/testconfiguration"
+	"github.com/forceu/gokapi/internal/webserver/ratelimiter"
 )
 
 func TestMain(m *testing.M) {
 	testconfiguration.Create(true)
 	configuration.Load()
-	processingstatus.Init(sse.New())
+	configuration.ConnectDatabase()
+	generateTestData()
+	ratelimiter.SetUnitTestMode(true)
 	exitVal := m.Run()
 	testconfiguration.Delete()
 	os.Exit(exitVal)
 }
 
-// TODO test new permission system
+const (
+	idInvalidUser            = 99
+	idSuperAdmin             = 100
+	idAdmin                  = 101
+	idUser                   = 102
+	idApiKeyAdmin            = "ApiKeyAdmin"
+	idApiKeySuperAdmin       = "ApiKeySuperAdmin"
+	idPublicApiKeySuperAdmin = "OGeidahfiep1Akeevahkoh1quechieP6ael"
+	idFileUser               = "newTestFile"
+	idFileAdmin              = "otherTestFile"
+)
 
-const maxMemory = 20
-
-var newKeyId string
-
-func TestNewKey(t *testing.T) {
-	newKeyId = NewKey(true)
-	key, ok := database.GetApiKey(newKeyId)
-	test.IsEqualBool(t, ok, true)
-	test.IsEqualString(t, key.FriendlyName, "Unnamed key")
-	test.IsEqualBool(t, key.Permissions == models.ApiPermAllNoApiMod, true)
-
-	newKeyId = NewKey(false)
-	key, ok = database.GetApiKey(newKeyId)
-	test.IsEqualBool(t, ok, true)
-	test.IsEqualBool(t, key.Permissions == models.ApiPermNone, true)
+func generateTestData() {
+	newUser := models.User{
+		Id:            idUser,
+		Name:          "TestUser",
+		Permissions:   models.UserPermissionNone,
+		UserLevel:     models.UserLevelUser,
+		ResetPassword: false,
+	}
+	newAdmin := models.User{
+		Id:            idAdmin,
+		Name:          "TestAdmin",
+		Permissions:   models.UserPermissionAll,
+		UserLevel:     models.UserLevelAdmin,
+		ResetPassword: false,
+	}
+	newSuperAdmin := models.User{
+		Id:            idSuperAdmin,
+		Name:          "TestSuperAdmin",
+		Permissions:   models.UserPermissionAll,
+		UserLevel:     models.UserLevelSuperAdmin,
+		ResetPassword: false,
+	}
+	database.SaveUser(newUser, false)
+	database.SaveUser(newAdmin, false)
+	database.SaveUser(newSuperAdmin, false)
+	database.SaveApiKey(models.ApiKey{
+		Id:           idApiKeyAdmin,
+		PublicId:     idApiKeyAdmin,
+		FriendlyName: "Admin",
+		Permissions:  models.ApiPermNone,
+		UserId:       idAdmin,
+	})
+	database.SaveApiKey(models.ApiKey{
+		Id:           idApiKeySuperAdmin,
+		PublicId:     idPublicApiKeySuperAdmin,
+		FriendlyName: "SuperAdmin",
+		Permissions:  models.ApiPermNone,
+		UserId:       idSuperAdmin,
+	})
+	database.SaveMetaData(models.File{
+		Id:                 idFileUser,
+		Name:               idFileUser + "Name",
+		SHA1:               "e017693e4a04a59d0b0f400fe98177fe7ee13cf7",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		UserId:             idUser,
+	})
+	database.SaveMetaData(models.File{
+		Id:                 idFileAdmin,
+		Name:               idFileAdmin + "Name",
+		SHA1:               "e017693e4a04a59d0b0f400fe98177fe7ee13cf7",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		UserId:             idAdmin,
+	})
 }
 
-func TestDeleteKey(t *testing.T) {
-	key, ok := database.GetApiKey(newKeyId)
+func getRecorder(url, apikey string, headers []test.Header) (*httptest.ResponseRecorder, *http.Request) {
+	return getRecorderWithBody(url, apikey, "GET", headers, nil)
+}
+
+func getRecorderWithBody(url, apikey, method string, headers []test.Header, body io.Reader) (*httptest.ResponseRecorder, *http.Request) {
+	var passedHeaders []test.Header
+	if apikey != "" {
+		passedHeaders = append(passedHeaders, test.Header{
+			Name:  "apikey",
+			Value: apikey,
+		})
+	}
+	for _, header := range headers {
+		passedHeaders = append(passedHeaders, header)
+	}
+	return test.GetRecorder(method, url, nil, passedHeaders, body)
+}
+
+func testAuthorisation(t *testing.T, url string, requiredPermission models.ApiPermission) models.ApiKey {
+	w, r := getRecorder(url, "", []test.Header{{}})
+	Process(w, r)
+	test.IsEqualBool(t, w.Code != 200, true)
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"Unauthorized","ErrorCode":2}`)
+
+	w, r = getRecorder(url, "invalid", []test.Header{{}})
+	Process(w, r)
+	test.IsEqualBool(t, w.Code != 200, true)
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"Unauthorized","ErrorCode":2}`)
+
+	newApiKeyUser := generateNewKey(false, idUser, "", "")
+	w, r = getRecorder(url, newApiKeyUser.Id, []test.Header{{}})
+	Process(w, r)
+	test.IsEqualBool(t, w.Code != 200, true)
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"Unauthorized","ErrorCode":2}`)
+
+	for _, permission := range getAvailableApiPermissions() {
+		if permission == requiredPermission {
+			continue
+		}
+		setPermissionApikey(t, newApiKeyUser.Id, permission)
+		w, r = getRecorder(url, newApiKeyUser.Id, []test.Header{{}})
+		Process(w, r)
+		test.IsEqualBool(t, w.Code != 200, true)
+		test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"Unauthorized","ErrorCode":2}`)
+		removePermissionApikey(t, newApiKeyUser.Id, permission)
+	}
+	newApiKeyUser.Permissions = getPermissionAll()
+	newApiKeyUser.RemovePermission(requiredPermission)
+	database.SaveApiKey(newApiKeyUser)
+	w, r = getRecorder(url, newApiKeyUser.Id, []test.Header{{}})
+	Process(w, r)
+	test.IsEqualBool(t, w.Code != 200, true)
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"Unauthorized","ErrorCode":2}`)
+	newApiKeyUser.Permissions = models.ApiPermNone
+	newApiKeyUser.GrantPermission(requiredPermission)
+	database.SaveApiKey(newApiKeyUser)
+	return newApiKeyUser
+}
+
+type invalidParameterValue struct {
+	Value         string
+	ErrorMessage  string
+	ErrorMessages []string
+	StatusCode    int
+}
+
+func testInvalidParameters(t *testing.T, url, apiKey string, validHeaders []test.Header, headerName string, invalidValues []invalidParameterValue) {
+	t.Helper()
+	for _, invalidHeader := range invalidValues {
+		headers := make([]test.Header, len(validHeaders))
+		copy(headers, validHeaders)
+		headers = append(headers, test.Header{
+			Name:  headerName,
+			Value: invalidHeader.Value,
+		})
+		w, r := getRecorderWithBody(url, apiKey, "GET", headers, nil)
+		Process(w, r)
+		test.IsEqualInt(t, w.Code, invalidHeader.StatusCode)
+		if len(invalidHeader.ErrorMessages) > 0 {
+			test.ResponseBodyIsWithAlternate(t, w, invalidHeader.ErrorMessages)
+		} else {
+			test.ResponseBodyIs(t, w, invalidHeader.ErrorMessage)
+		}
+		if invalidHeader.Value == "" {
+			w, r = getRecorder(url, apiKey, validHeaders)
+			Process(w, r)
+			test.IsEqualInt(t, w.Code, invalidHeader.StatusCode)
+			test.ResponseBodyIs(t, w, invalidHeader.ErrorMessage)
+		}
+	}
+}
+
+func testInvalidUserId(t *testing.T, url, apiKey string, validHeaders []test.Header) {
+	t.Helper()
+	const headerUserId = "userid"
+
+	var invalidParameter = []invalidParameterValue{
+		{
+			Value:        "",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"header userid is required","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        strconv.Itoa(idInvalidUser),
+			ErrorMessage: `{"Result":"error","ErrorMessage":"Invalid user id provided.","ErrorCode":5}`,
+			StatusCode:   404,
+		},
+		{
+			Value:        "invalid",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"invalid value in header userid supplied","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value: strconv.Itoa(idUser),
+			ErrorMessages: []string{`{"Result":"error","ErrorMessage":"Cannot modify yourself","ErrorCode":19}`,
+				`{"Result":"error","ErrorMessage":"Cannot delete yourself","ErrorCode":19}`,
+				`{"Result":"error","ErrorMessage":"Cannot reset password of yourself","ErrorCode":19}`},
+			StatusCode: 400,
+		},
+		{
+			Value: strconv.Itoa(idSuperAdmin),
+			ErrorMessages: []string{`{"Result":"error","ErrorMessage":"Cannot modify super admin","ErrorCode":19}`,
+				`{"Result":"error","ErrorMessage":"Cannot delete super admin","ErrorCode":19}`,
+				`{"Result":"error","ErrorMessage":"Cannot reset password of super admin","ErrorCode":19}`},
+			StatusCode: 400,
+		},
+	}
+	testInvalidParameters(t, url, apiKey, validHeaders, headerUserId, invalidParameter)
+}
+
+func testInvalidApiKey(t *testing.T, url, apiKey string, validHeaders []test.Header) {
+	t.Helper()
+	const headerApiKey = "targetKey"
+
+	var invalidParameter = []invalidParameterValue{
+		{
+			Value:        "",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"header targetKey is required","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "invalid",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"Invalid key ID provided.","ErrorCode":5}`,
+			StatusCode:   404,
+		},
+		{
+			Value: idApiKeySuperAdmin,
+			ErrorMessages: []string{`{"Result":"error","ErrorMessage":"No permission to delete this API key","ErrorCode":6}`,
+				`{"Result":"error","ErrorMessage":"No permission to edit this API key","ErrorCode":6}`},
+			StatusCode: 401,
+		},
+		{
+			Value: idPublicApiKeySuperAdmin,
+			ErrorMessages: []string{`{"Result":"error","ErrorMessage":"No permission to delete this API key","ErrorCode":6}`,
+				`{"Result":"error","ErrorMessage":"No permission to edit this API key","ErrorCode":6}`},
+			StatusCode: 401,
+		},
+		{
+			Value: idApiKeyAdmin,
+			ErrorMessages: []string{`{"Result":"error","ErrorMessage":"No permission to delete this API key","ErrorCode":6}`,
+				`{"Result":"error","ErrorMessage":"No permission to edit this API key","ErrorCode":6}`},
+			StatusCode: 401,
+		},
+	}
+	testInvalidParameters(t, url, apiKey, validHeaders, headerApiKey, invalidParameter)
+}
+
+func testInvalidFileId(t *testing.T, url, apiKey string, isReplacingCall bool) {
+	t.Helper()
+	const headerId = "id"
+	const headerIdReplace = "idNewContent"
+
+	header := headerId
+	if isReplacingCall {
+		header = headerIdReplace
+	}
+
+	var invalidParameter = []invalidParameterValue{
+		{
+			Value:        "",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"header id is required","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "invalidFile",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"Invalid id provided.","ErrorCode":5}`,
+			StatusCode:   404,
+		},
+		{
+			Value:        idFileAdmin,
+			ErrorMessage: `{"Result":"error","ErrorMessage":"No permission to duplicate this file","ErrorCode":6}`,
+			StatusCode:   401,
+		},
+	}
+	testInvalidParameters(t, url, apiKey, []test.Header{{}}, header, invalidParameter)
+}
+
+func TestInvalidRouting(t *testing.T) {
+
+	const apiUrl = "/invalid"
+	w, r := getRecorder(apiUrl, "invalid", []test.Header{{}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 400)
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"Invalid request","ErrorCode":1}`)
+}
+
+// ## /user/##
+
+func TestUserCreate(t *testing.T) {
+	const apiUrl = "/user/create"
+	const headerUsername = "username"
+
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermManageUsers)
+
+	w, r := getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerUsername,
+		Value: "1234",
+	}})
+	Process(w, r)
+	test.ResponseBodyIs(t, w, `{"id":103,"name":"1234","permissions":0,"userLevel":2,"lastOnline":0,"resetPassword":false}`)
+
+	var invalidParameter = []invalidParameterValue{
+		{
+			Value:        "",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"header username is required","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "1",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"Invalid username provided.","ErrorCode":6}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "1234",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"User already exists.","ErrorCode":7}`,
+			StatusCode:   409,
+		},
+	}
+	testInvalidParameters(t, apiUrl, apiKey.Id, []test.Header{{}}, headerUsername, invalidParameter)
+
+	defer test.ExpectPanic(t)
+	apiCreateUser(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func TestUserChangeRank(t *testing.T) {
+	const apiUrl = "/user/changeRank"
+	const headerUserId = "userid"
+	const headerNewRank = "newRank"
+
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermManageUsers)
+
+	testInvalidUserId(t, apiUrl, apiKey.Id, []test.Header{{Name: headerNewRank, Value: "admin"}})
+	var validHeaders = []test.Header{
+		{
+			Name:  headerUserId,
+			Value: strconv.Itoa(idAdmin),
+		},
+	}
+	invalidParameter := []invalidParameterValue{
+		{
+			Value:        "",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"header newRank is required","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "invalid",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"invalid rank","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+	}
+	testInvalidParameters(t, apiUrl, apiKey.Id, validHeaders, headerNewRank, invalidParameter)
+
+	user, ok := database.GetUser(idAdmin)
 	test.IsEqualBool(t, ok, true)
-	test.IsEqualString(t, key.FriendlyName, "Unnamed key")
-	result := DeleteKey(newKeyId)
-	test.IsEqualBool(t, result, true)
-	_, ok = database.GetApiKey(newKeyId)
-	test.IsEqualBool(t, ok, false)
-	result = DeleteKey("invalid")
-	test.IsEqualBool(t, result, false)
+	test.IsEqual(t, user.UserLevel, models.UserLevelAdmin)
+	w, r := getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerUserId,
+		Value: strconv.Itoa(idAdmin),
+	}, {
+		Name:  headerNewRank,
+		Value: "USER",
+	}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	user, ok = database.GetUser(idAdmin)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqual(t, user.UserLevel, models.UserLevelUser)
+	w, r = getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerUserId,
+		Value: strconv.Itoa(idAdmin),
+	}, {
+		Name:  headerNewRank,
+		Value: "ADMIN",
+	}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 400)
+	user, ok = database.GetUser(idAdmin)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqual(t, user.UserLevel, models.UserLevelUser)
+	user, _ = database.GetUser(idUser)
+	user.UserLevel = models.UserLevelAdmin
+	database.SaveUser(user, false)
+
+	w, r = getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerUserId,
+		Value: strconv.Itoa(idAdmin),
+	}, {
+		Name:  headerNewRank,
+		Value: "ADMIN",
+	}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	user, ok = database.GetUser(idAdmin)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqual(t, user.UserLevel, models.UserLevelAdmin)
+
+	user, _ = database.GetUser(idUser)
+	user.UserLevel = models.UserLevelUser
+	database.SaveUser(user, false)
+
+	defer test.ExpectPanic(t)
+	apiChangeUserRank(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func TestUserDelete(t *testing.T) {
+	const apiUrl = "/user/delete"
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermManageUsers)
+	testInvalidUserId(t, apiUrl, apiKey.Id, []test.Header{})
+	testDeleteUserCall(t, apiKey.Id, deleteUserCallModeDeleteFiles)
+	testDeleteUserCall(t, apiKey.Id, deleteUserCallModeKeepFiles)
+	testDeleteUserCall(t, apiKey.Id, deleteUserCallModeInvalidOperator)
+
+	defer test.ExpectPanic(t)
+	apiDeleteUser(nil, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+const (
+	deleteUserCallModeDeleteFiles     = iota
+	deleteUserCallModeKeepFiles       = iota
+	deleteUserCallModeInvalidOperator = iota
+)
+
+func testDeleteUserCall(t *testing.T, apiKey string, mode int) {
+	const apiUrl = "/user/delete"
+	const headerUserId = "userid"
+	const headerDeleteFiles = "deleteFiles"
+
+	user := models.User{
+		Name:      "ToDelete",
+		UserLevel: models.UserLevelAdmin,
+	}
+	database.SaveUser(user, true)
+	retrievedUser, ok := database.GetUserByName("ToDelete")
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, retrievedUser.Id != idUser, true)
+	session := models.Session{
+		RenewAt:    2147483645,
+		ValidUntil: 2147483645,
+		UserId:     retrievedUser.Id,
+	}
+	database.SaveSession("sessionApiDelete", session)
+	_, ok = database.GetSession("sessionApiDelete")
+	test.IsEqualBool(t, ok, true)
+	userApiKey := generateNewKey(false, retrievedUser.Id, "", "")
+	_, ok = database.GetApiKey(userApiKey.Id)
+	test.IsEqualBool(t, ok, true)
+	testFile := models.File{
+		Id:                 "testFileApiDelete",
+		Name:               "testFileApiDelete",
+		UserId:             retrievedUser.Id,
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+	}
+	database.SaveMetaData(testFile)
+	testFile, ok = database.GetMetaDataById("testFileApiDelete")
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualInt(t, testFile.UserId, retrievedUser.Id)
+
+	var deleteMetaFile string
+	switch mode {
+	case deleteUserCallModeDeleteFiles:
+		deleteMetaFile = "true"
+	case deleteUserCallModeKeepFiles:
+		deleteMetaFile = "false"
+	case deleteUserCallModeInvalidOperator:
+		deleteMetaFile = "invalid"
+	}
+
+	w, r := getRecorder(apiUrl, apiKey, []test.Header{{
+		Name:  headerUserId,
+		Value: strconv.Itoa(retrievedUser.Id),
+	}, {
+		Name:  headerDeleteFiles,
+		Value: deleteMetaFile,
+	}})
+	Process(w, r)
+
+	if mode == deleteUserCallModeInvalidOperator {
+		test.IsEqualInt(t, w.Code, 400)
+	} else {
+		test.IsEqualInt(t, w.Code, 200)
+		_, ok = database.GetUser(retrievedUser.Id)
+		test.IsEqualBool(t, ok, false)
+		_, ok = database.GetSession("sessionApiDelete")
+		test.IsEqualBool(t, ok, false)
+		_, ok = database.GetApiKey(userApiKey.Id)
+		test.IsEqualBool(t, ok, false)
+		testFile, ok = database.GetMetaDataById("testFileApiDelete")
+		test.IsEqualBool(t, ok, mode == deleteUserCallModeKeepFiles)
+		if mode == deleteUserCallModeKeepFiles {
+			test.IsEqualBool(t, ok, true)
+			test.IsEqualInt(t, testFile.UserId, idUser)
+		} else {
+			test.IsEqualBool(t, ok, false)
+		}
+	}
+
+}
+
+func TestUserModify(t *testing.T) {
+	const apiUrl = "/user/modify"
+	const headerUserId = "userid"
+	const headerPermission = "userpermission"
+	const headerModifier = "permissionModifier"
+	const idNewKey = "idNewKey"
+
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermManageUsers)
+	testInvalidUserId(t, apiUrl, apiKey.Id, []test.Header{{Name: headerPermission, Value: "PERM_REPLACE"}, {Name: headerModifier, Value: "GRANT"}})
+
+	var validHeaders = []test.Header{
+		{
+			Name:  headerUserId,
+			Value: strconv.Itoa(idAdmin),
+		}, {
+			Name:  headerModifier,
+			Value: "GRANT",
+		},
+	}
+	invalidParameter := []invalidParameterValue{
+		{
+			Value:        "",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"header userpermission is required","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "invalid",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"invalid permission","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "PERM_REPLACEE",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"invalid permission","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+	}
+	testInvalidParameters(t, apiUrl, apiKey.Id, validHeaders, headerPermission, invalidParameter)
+
+	user := models.User{
+		Name:        "ToModify",
+		UserLevel:   models.UserLevelAdmin,
+		Permissions: models.UserPermissionNone,
+	}
+	database.SaveUser(user, true)
+	retrievedUser, ok := database.GetUserByName("ToModify")
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, retrievedUser.Id != idUser, true)
+	test.IsEqualBool(t, ok, true)
+}
+
+func TestUserPasswordReset(t *testing.T) {
+	const apiUrl = "/user/resetPassword"
+	const headerUserId = "userid"
+	const headerSetNewPw = "generateNewPassword"
+
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermManageUsers)
+	testInvalidUserId(t, apiUrl, apiKey.Id, []test.Header{})
+	user, ok := database.GetUser(idAdmin)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, user.ResetPassword, false)
+	user.Password = "1234"
+	database.SaveUser(user, false)
+	w, r := getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerUserId,
+		Value: strconv.Itoa(idAdmin),
+	}, {
+		Name:  headerSetNewPw,
+		Value: "false",
+	}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	user, ok = database.GetUser(idAdmin)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, user.ResetPassword, true)
+	test.IsEqualString(t, user.Password, "1234")
+	test.ResponseBodyIs(t, w, `{"Result":"OK","password":""}`)
+
+	user.ResetPassword = false
+	database.SaveUser(user, false)
+	user, ok = database.GetUser(idAdmin)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, user.ResetPassword, false)
+
+	w, r = getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerUserId,
+		Value: strconv.Itoa(idAdmin),
+	}, {
+		Name:  headerSetNewPw,
+		Value: "true",
+	}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	user, ok = database.GetUser(idAdmin)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, user.ResetPassword, true)
+	test.IsEqualBool(t, user.Password != "1234", true)
+	type response struct {
+		Result   string `json:"Result"`
+		Password string `json:"password"`
+	}
+	var resp response
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	test.IsNil(t, err)
+	test.IsEqualString(t, resp.Result, "OK")
+	test.IsNotEmpty(t, resp.Password)
+
+	defer test.ExpectPanic(t)
+	apiResetPassword(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func testUserModifyCall(t *testing.T, apiKey string, userId int, permission string, grant bool) {
+	const apiUrl = "/user/modify"
+	const headerUserId = "userid"
+	const headerPermission = "userpermission"
+	const headerPermModifier = "permissionModifier"
+
+	modifier := "REVOKE"
+	if grant {
+		modifier = "GRANT"
+	}
+	w, r := getRecorder(apiUrl, apiKey, []test.Header{{
+		Name:  headerUserId,
+		Value: strconv.Itoa(userId),
+	}, {
+		Name:  headerPermission,
+		Value: permission,
+	}, {
+		Name:  headerPermModifier,
+		Value: modifier,
+	}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+}
+
+// ## /auth ##
+
+func TestNewApiKey(t *testing.T) {
+	const apiUrl = "/auth/create"
+	const headerFriendlyName = "friendlyName"
+	const headerDefaultPerm = "basicPermissions"
+
+	const (
+		testNoParam = iota
+		testFriendlyName
+		testBasicPermission
+		testBoth
+	)
+
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermApiMod)
+	keysBefore := countApiKeys()
+
+	for i := testNoParam; i <= testBoth; i++ {
+		friendlyName := "Unnamed key"
+		expectedPermissions := models.ApiPermNone
+		var headers []test.Header
+		if i == testFriendlyName || i == testBoth {
+			friendlyName = helper.GenerateRandomString(40)
+			headers = append(headers, test.Header{
+				Name:  headerFriendlyName,
+				Value: friendlyName,
+			})
+		}
+		if i == testBasicPermission || i == testBoth {
+			headers = append(headers, test.Header{
+				Name:  headerDefaultPerm,
+				Value: "true",
+			})
+			expectedPermissions = models.ApiPermDefault
+		}
+		w, r := getRecorder(apiUrl, apiKey.Id, headers)
+		Process(w, r)
+		test.IsEqualInt(t, w.Code, 200)
+		var response models.ApiKeyOutput
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		test.IsNil(t, err)
+		test.IsEqualString(t, response.Result, "OK")
+		test.IsNotEmpty(t, response.Id)
+		test.IsNotEmpty(t, response.PublicId)
+		test.IsEqualBool(t, response.PublicId != response.Id, true)
+		retrievedKey, ok := database.GetApiKey(response.Id)
+		test.IsEqualBool(t, ok, true)
+		test.IsEqualString(t, response.PublicId, retrievedKey.PublicId)
+		test.IsEqualString(t, retrievedKey.FriendlyName, friendlyName)
+		test.IsEqualInt(t, countApiKeys(), keysBefore+i+1)
+		test.IsEqual(t, retrievedKey.Permissions, expectedPermissions)
+	}
+
+	defer test.ExpectPanic(t)
+	apiCreateApiKey(nil, &paramUserCreate{}, models.User{Id: 7}, apiKey)
 }
 
 func TestIsValidApiKey(t *testing.T) {
-	test.IsEqualBool(t, IsValidApiKey("", false, models.ApiPermNone), false)        // TODO permission
-	test.IsEqualBool(t, IsValidApiKey("invalid", false, models.ApiPermNone), false) // TODO permission
-	test.IsEqualBool(t, IsValidApiKey("validkey", false, models.ApiPermNone), true) // TODO permission
+	user, apiKey, isValid := isValidApiKey("", false, models.ApiPermNone)
+	test.IsEqualBool(t, isValid, false)
+	_, _, isValid = isValidApiKey("invalid", false, models.ApiPermNone)
+	test.IsEqualBool(t, isValid, false)
+	user, apiKey, isValid = isValidApiKey("validkey", false, models.ApiPermNone)
+	test.IsEqualBool(t, isValid, true)
+	test.IsEqualString(t, apiKey.Id, "validkey")
+	test.IsEqualInt(t, user.Id, 5)
 	key, ok := database.GetApiKey("validkey")
 	test.IsEqualBool(t, ok, true)
 	test.IsEqualBool(t, key.LastUsed == 0, true)
-	test.IsEqualBool(t, IsValidApiKey("validkey", true, models.ApiPermNone), true) // TODO permission
+	user, apiKey, isValid = isValidApiKey("validkey", true, models.ApiPermNone)
+	test.IsEqualBool(t, isValid, true)
+	test.IsEqualInt(t, user.Id, 5)
+	test.IsEqualString(t, apiKey.Id, "validkey")
 	key, ok = database.GetApiKey("validkey")
 	test.IsEqualBool(t, ok, true)
 	test.IsEqualBool(t, key.LastUsed == 0, false)
+
+	newApiKey := generateNewKey(false, 5, "", "")
+	user, _, isValid = isValidApiKey(newApiKey.Id, true, models.ApiPermNone)
+	test.IsEqualBool(t, isValid, true)
+	for _, permission := range getAvailableApiPermissions() {
+		_, _, isValid = isValidApiKey(newApiKey.Id, true, permission)
+		test.IsEqualBool(t, isValid, false)
+	}
+	for _, newPermission := range getAvailableApiPermissions() {
+		setPermissionApikey(t, newApiKey.Id, newPermission)
+		for _, permission := range getAvailableApiPermissions() {
+			_, _, isValid = isValidApiKey(newApiKey.Id, true, permission)
+			test.IsEqualBool(t, isValid, permission == newPermission)
+		}
+		removePermissionApikey(t, newApiKey.Id, newPermission)
+	}
+	setPermissionApikey(t, newApiKey.Id, models.ApiPermEdit|models.ApiPermDelete)
+	_, _, isValid = isValidApiKey(newApiKey.Id, true, models.ApiPermEdit)
+	test.IsEqualBool(t, isValid, true)
+	_, _, isValid = isValidApiKey(newApiKey.Id, true, getPermissionAll())
+	test.IsEqualBool(t, isValid, false)
+	_, _, isValid = isValidApiKey(newApiKey.Id, true, models.ApiPermView)
+	test.IsEqualBool(t, isValid, false)
 }
 
-func TestProcess(t *testing.T) {
-	w, r := test.GetRecorder("GET", "/api/auth/friendlyname", nil, nil, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "{\"Result\":\"error\",\"ErrorMessage\":\"Unauthorized\"}")
-	w, r = test.GetRecorder("GET", "/api/invalid", nil, nil, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Invalid request")
-	w, r = test.GetRecorder("GET", "/api/invalid", nil, []test.Header{{
-		Name:  "apikey",
-		Value: "validkey",
-	}}, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Invalid request")
-	w, r = test.GetRecorder("GET", "/api/invalid", []test.Cookie{{
-		Name:  "session_token",
-		Value: "validsession",
-	}}, nil, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Invalid request")
+func setPermissionApikey(t *testing.T, key string, newPermission models.ApiPermission) {
+	apiKey, ok := database.GetApiKey(key)
+	test.IsEqualBool(t, ok, true)
+	apiKey.GrantPermission(newPermission)
+	database.SaveApiKey(apiKey)
+}
+func removePermissionApikey(t *testing.T, key string, newPermission models.ApiPermission) {
+	apiKey, ok := database.GetApiKey(key)
+	test.IsEqualBool(t, ok, true)
+	apiKey.RemovePermission(newPermission)
+	database.SaveApiKey(apiKey)
 }
 
-func TestAuthDisabledLogin(t *testing.T) {
-	w, r := test.GetRecorder("GET", "/api/auth/friendlyname", nil, nil, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "{\"Result\":\"error\",\"ErrorMessage\":\"Unauthorized\"}")
-	configuration.Get().Authentication.Method = authentication.Disabled
-	w, r = test.GetRecorder("GET", "/api/auth/friendlyname", nil, nil, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "{\"Result\":\"error\",\"ErrorMessage\":\"Unauthorized\"}")
-	configuration.Get().Authentication.Method = authentication.Internal
+func getAvailableApiPermissions() []models.ApiPermission {
+	result := []models.ApiPermission{
+		models.ApiPermView,
+		models.ApiPermUpload,
+		models.ApiPermDelete,
+		models.ApiPermApiMod,
+		models.ApiPermEdit,
+		models.ApiPermReplace,
+		models.ApiPermManageUsers,
+		models.ApiPermManageLogs,
+		models.ApiPermManageFileRequests,
+		models.ApiPermDownload,
+	}
+	return result
+}
+
+func getPermissionAll() models.ApiPermission {
+	allPermissions := models.ApiPermNone
+	for _, permission := range getAvailableApiPermissions() {
+		allPermissions += permission
+	}
+	return allPermissions
+}
+
+func getApiPermMap(t *testing.T) map[models.ApiPermission]string {
+	result := make(map[models.ApiPermission]string)
+	result[models.ApiPermView] = "PERM_VIEW"
+	result[models.ApiPermUpload] = "PERM_UPLOAD"
+	result[models.ApiPermDelete] = "PERM_DELETE"
+	result[models.ApiPermApiMod] = "PERM_API_MOD"
+	result[models.ApiPermEdit] = "PERM_EDIT"
+	result[models.ApiPermReplace] = "PERM_REPLACE"
+	result[models.ApiPermManageUsers] = "PERM_MANAGE_USERS"
+	result[models.ApiPermManageLogs] = "PERM_MANAGE_LOGS"
+	result[models.ApiPermManageFileRequests] = "PERM_MANAGE_FILE_REQUESTS"
+	result[models.ApiPermDownload] = "PERM_DOWNLOAD"
+
+	sum := 0
+	for perm := range result {
+		sum = sum + int(perm)
+	}
+	if sum != int(getPermissionAll()) {
+		t.Fatal("List of permissions are incorrect")
+	}
+
+	return result
+}
+
+func getUserPermMap(t *testing.T) map[models.UserPermission]string {
+	result := make(map[models.UserPermission]string)
+	result[models.UserPermReplaceUploads] = "PERM_REPLACE"
+	result[models.UserPermListOtherUploads] = "PERM_LIST"
+	result[models.UserPermEditOtherUploads] = "PERM_EDIT"
+	result[models.UserPermReplaceOtherUploads] = "PERM_REPLACE_OTHER"
+	result[models.UserPermDeleteOtherUploads] = "PERM_DELETE"
+	result[models.UserPermManageLogs] = "PERM_LOGS"
+	result[models.UserPermManageApiKeys] = "PERM_API"
+	result[models.UserPermManageUsers] = "PERM_USERS"
+
+	sum := 0
+	for perm := range result {
+		sum = sum + int(perm)
+	}
+	if sum != int(models.UserPermissionAll) {
+		t.Fatal("List of permissions are incorrect")
+	}
+	return result
+}
+
+func grantUserPermission(t *testing.T, userId int, permission models.UserPermission) {
+	user, ok := database.GetUser(userId)
+	test.IsEqualBool(t, ok, true)
+	user.GrantPermission(permission)
+	database.SaveUser(user, false)
+}
+func removeUserPermission(t *testing.T, userId int, permission models.UserPermission) {
+	user, ok := database.GetUser(userId)
+	test.IsEqualBool(t, ok, true)
+	user.RemovePermission(permission)
+	database.SaveUser(user, false)
+}
+
+func TestDeleteApiKey(t *testing.T) {
+	const apiUrl = "/auth/delete"
+	const headerApiDelete = "targetKey"
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermApiMod)
+	testInvalidApiKey(t, apiUrl, apiKey.Id, []test.Header{})
+
+	database.SaveApiKey(models.ApiKey{
+		Id:       "toDelete",
+		PublicId: "toDelete",
+		UserId:   idUser,
+	})
+	_, ok := database.GetApiKey("toDelete")
+	test.IsEqualBool(t, ok, true)
+
+	invalidParameter := []invalidParameterValue{
+		{
+			Value:        "",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"header targetKey is required","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "invalid",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"Invalid key ID provided.","ErrorCode":5}`,
+			StatusCode:   404,
+		},
+	}
+	testInvalidParameters(t, apiUrl, apiKey.Id, []test.Header{}, headerApiDelete, invalidParameter)
+	_, ok = database.GetApiKey(apiKey.Id)
+	test.IsEqualBool(t, ok, true)
+
+	w, r := getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerApiDelete,
+		Value: apiKey.Id,
+	}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	_, ok = database.GetApiKey(apiKey.Id)
+	test.IsEqualBool(t, ok, false)
+
+	defer test.ExpectPanic(t)
+	apiDeleteKey(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func countApiKeys() int {
+	return len(database.GetAllApiKeys())
 }
 
 func TestChangeFriendlyName(t *testing.T) {
-	w, r := test.GetRecorder("GET", "/api/auth/friendlyname", nil, []test.Header{{
-		Name:  "apikey",
-		Value: "validkey",
-	}}, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Invalid api key provided.")
-	w, r = test.GetRecorder("GET", "/api/auth/friendlyname", nil, []test.Header{{
-		Name: "apikey", Value: "validkey"}, {
-		Name: "apiKeyToModify", Value: "validkey"}}, nil)
-	Process(w, r, maxMemory)
+	const apiUrl = "/auth/friendlyname"
+	const headerApiKeyModify = "targetKey"
+	const headerNewName = "friendlyName"
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermApiMod)
+	testInvalidApiKey(t, apiUrl, apiKey.Id, []test.Header{{Name: headerNewName, Value: "new name"}})
+	test.IsEqualString(t, apiKey.FriendlyName, "Unnamed key")
+	w, r := getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerApiKeyModify,
+		Value: apiKey.Id,
+	}, {
+		Name:  headerNewName,
+		Value: "New name for the key",
+	}})
+	Process(w, r)
 	test.IsEqualInt(t, w.Code, 200)
+	key, ok := database.GetApiKey(apiKey.Id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualString(t, key.FriendlyName, "New name for the key")
 
-	key, ok := database.GetApiKey("validkey")
-	test.IsEqualBool(t, ok, true)
-	test.IsEqualString(t, key.FriendlyName, "Unnamed key")
-	w, r = test.GetRecorder("GET", "/api/auth/friendlyname", nil, []test.Header{{
-		Name: "apikey", Value: "validkey"}, {
-		Name: "apiKeyToModify", Value: "validkey"}, {
-		Name: "friendlyName", Value: "NewName"}}, nil)
-	Process(w, r, maxMemory)
-	test.IsEqualInt(t, w.Code, 200)
-	key, ok = database.GetApiKey("validkey")
-	test.IsEqualBool(t, ok, true)
-	test.IsEqualString(t, key.FriendlyName, "NewName")
-	w = httptest.NewRecorder()
-	Process(w, r, maxMemory)
-	test.IsEqualInt(t, w.Code, 200)
+	w, r = getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerApiKeyModify,
+		Value: apiKey.Id,
+	}, {
+		Name:  headerNewName,
+		Value: "",
+	}})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 400)
+
+	defer test.ExpectPanic(t)
+	apiChangeFriendlyName(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
 }
 
-func TestDeleteFile(t *testing.T) {
-	w, r := test.GetRecorder("GET", "/api/files/delete", nil, []test.Header{{
-		Name:  "apikey",
-		Value: "validkey",
-	}}, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Invalid file ID provided")
-	w, r = test.GetRecorder("GET", "/api/files/delete", nil, []test.Header{{
-		Name:  "apikey",
-		Value: "validkey",
-	}, {
-		Name:  "id",
-		Value: "invalid",
-	},
-	}, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Invalid file ID provided")
-	file, ok := database.GetMetaDataById("jpLXGJKigM4hjtA6T6sN2")
+func TestApikeyModify(t *testing.T) {
+	const apiUrl = "/auth/modify"
+	const headerApiKeyModify = "targetKey"
+	const headerPermission = "permission"
+	const headerModifier = "permissionModifier"
+
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermApiMod)
+	testInvalidApiKey(t, apiUrl, apiKey.Id, []test.Header{{Name: headerPermission, Value: "PERM_VIEW"}, {Name: headerModifier, Value: "GRANT"}})
+
+	newApiKey := models.ApiKey{
+		Id:           "modifyTest",
+		PublicId:     "modifyTest",
+		FriendlyName: "modifyTest",
+		UserId:       idUser,
+	}
+	database.SaveApiKey(newApiKey)
+	retrievedApiKey, ok := database.GetApiKey("modifyTest")
 	test.IsEqualBool(t, ok, true)
-	test.IsEqualString(t, file.Id, "jpLXGJKigM4hjtA6T6sN2")
-	w, r = test.GetRecorder("GET", "/api/files/delete", nil, []test.Header{{
-		Name:  "apikey",
-		Value: "validkey",
+	test.IsEqual(t, retrievedApiKey.Permissions, models.ApiPermNone)
+
+	var validHeaders = []test.Header{
+		{
+			Name:  headerApiKeyModify,
+			Value: retrievedApiKey.Id,
+		},
+		{
+			Name:  headerModifier,
+			Value: "GRANT",
+		},
+	}
+	invalidParameter := []invalidParameterValue{
+		{
+			Value:        "",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"header permission is required","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "invalid",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"invalid permission","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "PERM_VIEWW",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"invalid permission","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+		{
+			Value:        "PERM_REPLACE",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"Insufficient user permission for owner to set this API permission","ErrorCode":6}`,
+			StatusCode:   401,
+		},
+		{
+			Value:        "PERM_MANAGE_USERS",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"Insufficient user permission for owner to set this API permission","ErrorCode":6}`,
+			StatusCode:   401,
+		},
+		{
+			Value:        "PERM_MANAGE_FILE_REQUESTS",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"Insufficient user permission for owner to set this API permission","ErrorCode":6}`,
+			StatusCode:   401,
+		},
+	}
+	testInvalidParameters(t, apiUrl, apiKey.Id, validHeaders, headerPermission, invalidParameter)
+
+	grantUserPermission(t, idUser, models.UserPermReplaceUploads)
+	grantUserPermission(t, idUser, models.UserPermManageUsers)
+	grantUserPermission(t, idUser, models.UserPermManageLogs)
+	grantUserPermission(t, idUser, models.UserPermGuestUploads)
+
+	for permissionUint, permissionString := range getApiPermMap(t) {
+		test.IsEqualBool(t, retrievedApiKey.HasPermission(permissionUint), false)
+		testApiModifyCall(t, apiKey, retrievedApiKey.Id, permissionString, true)
+		retrievedApiKey, ok = database.GetApiKey("modifyTest")
+		test.IsEqualBool(t, ok, true)
+		test.IsEqualBool(t, retrievedApiKey.HasPermission(permissionUint), true)
+		testApiModifyCall(t, apiKey, retrievedApiKey.Id, permissionString, false)
+		retrievedApiKey, ok = database.GetApiKey("modifyTest")
+		test.IsEqualBool(t, ok, true)
+		test.IsEqualBool(t, retrievedApiKey.HasPermission(permissionUint), false)
+	}
+	removeUserPermission(t, idUser, models.UserPermReplaceUploads)
+	removeUserPermission(t, idUser, models.UserPermManageUsers)
+	removeUserPermission(t, idUser, models.UserPermManageLogs)
+	removeUserPermission(t, idUser, models.UserPermGuestUploads)
+}
+
+func testApiModifyCall(t *testing.T, apiKey models.ApiKey, targetKey string, permission string, grant bool) {
+	const apiUrl = "/auth/modify"
+	const headerApiKeyModify = "targetKey"
+	const headerPermission = "permission"
+	const headerModifier = "permissionModifier"
+
+	modifier := "REVOKE"
+	if grant {
+		modifier = "GRANT"
+	}
+	w, r := getRecorder(apiUrl, apiKey.Id, []test.Header{{
+		Name:  headerApiKeyModify,
+		Value: targetKey,
 	}, {
-		Name:  "id",
-		Value: "jpLXGJKigM4hjtA6T6sN2",
-	},
-	}, nil)
-	Process(w, r, maxMemory)
+		Name:  headerPermission,
+		Value: permission,
+	}, {
+		Name:  headerModifier,
+		Value: modifier,
+	}})
+	Process(w, r)
 	test.IsEqualInt(t, w.Code, 200)
-	time.Sleep(time.Second)
-	_, ok = database.GetMetaDataById("jpLXGJKigM4hjtA6T6sN2")
+
+	defer test.ExpectPanic(t)
+	apiModifyApiKey(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+// ## /files ##
+
+func TestDeleteFile(t *testing.T) {
+	database.SaveMetaData(models.File{
+		Id:                 "smalltestfile1",
+		Name:               "smalltestfile1",
+		SHA1:               "03cfd743661f07975fa2f1220c5194cbaff48451",
+		ExpireAt:           2147483646,
+		DownloadsRemaining: 1,
+		UserId:             idUser,
+	})
+	database.SaveMetaData(models.File{
+		Id:                 "smalltestfile2",
+		Name:               "smalltestfile2",
+		SHA1:               "03cfd743661f07975fa2f1220c5194cbaff48451",
+		ExpireAt:           2147483646,
+		DownloadsRemaining: 1,
+		UserId:             idSuperAdmin,
+	})
+	database.SaveMetaData(models.File{
+		Id:                 "smalltestfileDelay",
+		Name:               "smalltestfileDelay",
+		SHA1:               "03cfd743661f07975fa2f1220c5194cbaff48451",
+		ExpireAt:           2147483646,
+		DownloadsRemaining: 1,
+		UserId:             idUser,
+	})
+	_, ok := database.GetMetaDataById("smalltestfile1")
+	test.IsEqualBool(t, ok, true)
+	_, ok = database.GetMetaDataById("smalltestfile2")
+	test.IsEqualBool(t, ok, true)
+	_, ok = database.GetMetaDataById("smalltestfileDelay")
+	test.IsEqualBool(t, ok, true)
+
+	apiKey := testAuthorisation(t, "/files/delete", models.ApiPermDelete)
+	testDeleteFileCall(t, apiKey, "", "", 400, `{"Result":"error","ErrorMessage":"header id is required","ErrorCode":4}`)
+	testDeleteFileCall(t, apiKey, "invalid", "", 404, `{"Result":"error","ErrorMessage":"Invalid file ID provided.","ErrorCode":5}`)
+	testDeleteFileCall(t, apiKey, "smalltestfile1", "invalid", 400, `{"Result":"error","ErrorMessage":"invalid value in header delay supplied","ErrorCode":4}`)
+	testDeleteFileCall(t, apiKey, "smalltestfile1", "", 200, "")
+	testDeleteFileCall(t, apiKey, "smalltestfileDelay", "1", 200, "")
+	testDeleteFileCall(t, apiKey, "smalltestfile2", "", 401, `{"Result":"error","ErrorMessage":"No permission to delete this file","ErrorCode":6}`)
+	_, ok = database.GetMetaDataById("smalltestfile2")
+	test.IsEqualBool(t, ok, true)
+	grantUserPermission(t, idUser, models.UserPermDeleteOtherUploads)
+	testDeleteFileCall(t, apiKey, "smalltestfile2", "", 200, "")
+	removeUserPermission(t, idUser, models.UserPermDeleteOtherUploads)
+
+	time.Sleep(200 * time.Millisecond)
+	_, ok = database.GetMetaDataById("smalltestfile1")
+	test.IsEqualBool(t, ok, false)
+	_, ok = database.GetMetaDataById("smalltestfile2")
+	test.IsEqualBool(t, ok, false)
+	file, ok := database.GetMetaDataById("smalltestfileDelay")
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, file.PendingDeletion != 0, true)
+
+	time.Sleep(900 * time.Millisecond)
+	_, ok = database.GetMetaDataById("smalltestfileDelay")
 	test.IsEqualBool(t, ok, false)
 }
 
-func TestUploadAndDuplication(t *testing.T) {
-	//
-	// Upload
-	//
+func testDeleteFileCall(t *testing.T, apiKey models.ApiKey, fileId, delay string, resultCode int, expectedResponse string) {
+	t.Helper()
+	const apiUrl = "/files/delete"
+	const headerFileId = "id"
+	const headerDelay = "delay"
+	headers := []test.Header{{}}
+	if fileId != "" {
+		headers = append(headers, test.Header{Name: headerFileId, Value: fileId})
+	}
+	if delay != "" {
+		headers = append(headers, test.Header{Name: headerDelay, Value: delay})
+	}
+	w, r := getRecorder(apiUrl, apiKey.Id, headers)
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, resultCode)
+	if expectedResponse != "" {
+		test.ResponseBodyIs(t, w, expectedResponse)
+	}
+
+	defer test.ExpectPanic(t)
+	apiDeleteFile(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func TestRestoreFile(t *testing.T) {
+	config := configuration.Get()
+	fileUser := models.File{
+		Id:                 "pendingdeletion1",
+		Name:               "pendingdeletion1",
+		SHA1:               "pendingdeletion",
+		ExpireAt:           2147483646,
+		DownloadsRemaining: 1,
+		UserId:             idUser,
+	}
+	fileAdmin := models.File{
+		Id:                 "pendingdeletion2",
+		Name:               "pendingdeletion2",
+		SHA1:               "pendingdeletion",
+		ExpireAt:           2147483646,
+		DownloadsRemaining: 1,
+		UserId:             idSuperAdmin,
+	}
+	database.SaveMetaData(fileUser)
+	database.SaveMetaData(fileAdmin)
+	_, ok := database.GetMetaDataById(fileUser.Id)
+	test.IsEqualBool(t, ok, true)
+	_, ok = database.GetMetaDataById(fileAdmin.Id)
+	test.IsEqualBool(t, ok, true)
+
+	apiKey := testAuthorisation(t, "/files/restore", models.ApiPermDelete)
+	testRestoreFileCall(t, apiKey, "", 400, `{"Result":"error","ErrorMessage":"header id is required","ErrorCode":4}`)
+	testRestoreFileCall(t, apiKey, "invalid", 404, `{"Result":"error","ErrorMessage":"Invalid file ID provided or file has already been deleted.","ErrorCode":5}`)
+	testRestoreFileCall(t, apiKey, fileUser.Id, 200, fileUser.ToJsonResult(config.ServerUrl, config.IncludeFilename))
+	testRestoreFileCall(t, apiKey, fileAdmin.Id, 401, `{"Result":"error","ErrorMessage":"No permission to restore this file","ErrorCode":6}`)
+
+	storage.DeleteFileSchedule(fileUser.Id, 500, true)
+	storage.DeleteFileSchedule(fileAdmin.Id, 500, true)
+
+	file, ok := database.GetMetaDataById(fileUser.Id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, file.PendingDeletion != 0, true)
+	file, ok = database.GetMetaDataById(fileAdmin.Id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, file.PendingDeletion != 0, true)
+
+	testRestoreFileCall(t, apiKey, fileUser.Id, 200, fileUser.ToJsonResult(config.ServerUrl, config.IncludeFilename))
+	testRestoreFileCall(t, apiKey, fileAdmin.Id, 401, `{"Result":"error","ErrorMessage":"No permission to restore this file","ErrorCode":6}`)
+
+	file, ok = database.GetMetaDataById(fileUser.Id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualInt64(t, file.PendingDeletion, 0)
+	file, ok = database.GetMetaDataById(fileAdmin.Id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualBool(t, file.PendingDeletion != 0, true)
+
+	startTime := time.Now()
+	for {
+		if time.Since(startTime) > 10*time.Second {
+			t.Errorf("Timeout waiting for file to be deleted")
+			break
+		}
+		_, ok = database.GetMetaDataById(fileAdmin.Id)
+		if !ok {
+			break
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	startTime = time.Now()
+	for {
+		if time.Since(startTime) > 10*time.Second {
+			t.Errorf("Timeout waiting for file to be restored")
+			break
+		}
+		file, ok = database.GetMetaDataById(fileUser.Id)
+		if !ok {
+			t.Errorf("File was deleted")
+			break
+		}
+		if file.PendingDeletion == 0 {
+			break
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	test.IsEqualInt64(t, file.PendingDeletion, 0)
+	storage.DeleteFile(fileUser.Id, true)
+}
+
+func testRestoreFileCall(t *testing.T, apiKey models.ApiKey, fileId string, resultCode int, expectedResponse string) {
+	t.Helper()
+	const apiUrl = "/files/restore"
+	const headerFileId = "id"
+	headers := []test.Header{{}}
+	if fileId != "" {
+		headers = append(headers, test.Header{Name: headerFileId, Value: fileId})
+	}
+	w, r := getRecorder(apiUrl, apiKey.Id, headers)
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, resultCode)
+	if expectedResponse != "" {
+		test.ResponseBodyIs(t, w, expectedResponse)
+	}
+
+	defer test.ExpectPanic(t)
+	apiRestoreFile(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func TestList(t *testing.T) {
+	const apiUrl = "/files/list"
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermView)
+
+	database.DeleteMetaData(idFileUser)
+	w, r := getRecorder(apiUrl, apiKey.Id, []test.Header{})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	test.ResponseBodyIs(t, w, "null")
+	generateTestData()
+
+	var result []models.FileApiOutput
+	grantUserPermission(t, idUser, models.UserPermListOtherUploads)
+	w, r = getRecorder(apiUrl, apiKey.Id, []test.Header{})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	err := json.Unmarshal(w.Body.Bytes(), &result)
+	test.IsNil(t, err)
+	test.IsEqualInt(t, len(result), 12)
+
+	removeUserPermission(t, idUser, models.UserPermListOtherUploads)
+	w, r = getRecorder(apiUrl, apiKey.Id, []test.Header{})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	err = json.Unmarshal(w.Body.Bytes(), &result)
+	test.IsNil(t, err)
+	test.IsEqualInt(t, len(result), 1)
+	test.IsEqualString(t, result[0].Name, "newTestFileName")
+}
+
+func TestListSingle(t *testing.T) {
+	const apiUrl = "/files/list/"
+	_ = testAuthorisation(t, apiUrl, models.ApiPermView)
+	apiKey := testAuthorisation(t, apiUrl+"newTestFile", models.ApiPermView)
+	var result models.FileApiOutput
+
+	w, r := getRecorder(apiUrl+"newTestFile", apiKey.Id, []test.Header{})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	err := json.Unmarshal(w.Body.Bytes(), &result)
+	test.IsNil(t, err)
+	test.IsEqualString(t, result.Name, "newTestFileName")
+
+	w, r = getRecorder(apiUrl+"e4TjE7CokWK0giiLNxDL", apiKey.Id, []test.Header{})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 401)
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"No permission to view file","ErrorCode":6}`)
+	w, r = getRecorder(apiUrl+"invalid", apiKey.Id, []test.Header{})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 404)
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"File not found","ErrorCode":5}`)
+
+	grantUserPermission(t, idUser, models.UserPermListOtherUploads)
+	w, r = getRecorder(apiUrl+"e4TjE7CokWK0giiLNxDL", apiKey.Id, []test.Header{})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	err = json.Unmarshal(w.Body.Bytes(), &result)
+	test.IsNil(t, err)
+	test.IsEqualString(t, result.Id, "e4TjE7CokWK0giiLNxDL")
+	removeUserPermission(t, idUser, models.UserPermListOtherUploads)
+
+	defer test.ExpectPanic(t)
+	apiListSingle(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func TestUpload(t *testing.T) {
+	apiKey := generateNewKey(false, idUser, "", "")
+	apiKey.GrantPermission(models.ApiPermUpload)
+	database.SaveApiKey(apiKey)
+	result, body := uploadNewFile(t)
+	test.IsEqualString(t, result.Result, "OK")
+	test.IsEqualString(t, result.FileInfo.Size, "3 B")
+	test.IsEqualInt(t, result.FileInfo.DownloadsRemaining, 200)
+	test.IsEqualBool(t, result.FileInfo.IsPasswordProtected, true)
+	test.IsEqualString(t, result.FileInfo.UrlDownload, "http://127.0.0.1:53843/d?id="+result.FileInfo.Id)
+	// newFileId := result.FileInfo.Id
+	w, r := test.GetRecorder("POST", "/api/files/add", nil, []test.Header{{
+		Name:  "apikey",
+		Value: apiKey.Id,
+	}}, body)
+	Process(w, r)
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"request Content-Type isn't multipart/form-data","ErrorCode":0}`)
+	test.IsEqualInt(t, w.Code, 400)
+
+	defer test.ExpectPanic(t)
+	apiUploadFile(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func uploadNewFile(t *testing.T) (models.Result, *bytes.Buffer) {
 	file, err := os.Open("test/fileupload.jpg")
 	test.IsNil(t, err)
 	defer file.Close()
@@ -184,242 +1332,135 @@ func TestUploadAndDuplication(t *testing.T) {
 	writer := multipart.NewWriter(body)
 	part, err := writer.CreateFormFile("file", filepath.Base(file.Name()))
 	test.IsNil(t, err)
-	io.Copy(part, file)
-	writer.WriteField("allowedDownloads", "200")
-	writer.WriteField("expiryDays", "10")
-	writer.WriteField("password", "12345")
-	writer.Close()
+	_, err = io.Copy(part, file)
+	test.IsNil(t, err)
+	err = writer.WriteField("allowedDownloads", "200")
+	test.IsNil(t, err)
+	err = writer.WriteField("expiryDays", "10")
+	test.IsNil(t, err)
+	err = writer.WriteField("password", "12345")
+	test.IsNil(t, err)
+	err = writer.Close()
+	test.IsNil(t, err)
+	newApiKeyUser := generateNewKey(true, idUser, "", "")
 	w, r := test.GetRecorder("POST", "/api/files/add", nil, []test.Header{{
 		Name:  "apikey",
-		Value: "validkey",
+		Value: newApiKeyUser.Id,
 	}}, body)
 	r.Header.Add("Content-Type", writer.FormDataContentType())
 
-	Process(w, r, maxMemory)
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
 	response, err := io.ReadAll(w.Result().Body)
 	test.IsNil(t, err)
 	result := models.Result{}
 	err = json.Unmarshal(response, &result)
 	test.IsNil(t, err)
-	test.IsEqualString(t, result.Result, "OK")
-	test.IsEqualString(t, result.FileInfo.Size, "3 B")
-	test.IsEqualInt(t, result.FileInfo.DownloadsRemaining, 200)
-	test.IsEqualBool(t, result.FileInfo.IsPasswordProtected, true)
-	test.IsEqualString(t, result.Url, "http://127.0.0.1:53843/d?id=")
-	newFileId := result.FileInfo.Id
+	return result, body
+}
 
-	w, r = test.GetRecorder("POST", "/api/files/add", nil, []test.Header{{
-		Name:  "apikey",
-		Value: "validkey",
-	}}, body)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Content-Type isn't multipart/form-data")
-	test.IsEqualInt(t, w.Code, 400)
+func TestDuplicate(t *testing.T) {
+	const apiUrl = "/files/duplicate"
+	const headerId = "id"
+	const headerAllowedDownloads = "allowedDownloads"
 
-	//
-	// Duplication
-	//
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{{
-		Name:  "apikey",
-		Value: "validkey",
-	}}, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Invalid id provided.")
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"},
-	}, nil)
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "Invalid id provided.")
+	apiKey := testAuthorisation(t, apiUrl, models.ApiPermUpload)
+	testInvalidFileId(t, apiUrl, apiKey.Id, false)
 
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader("§$§$%&(&//&/invalid"))
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "invalid URL escape")
+	validHeader := []test.Header{{Name: headerId, Value: idFileUser}}
+	invalidParameter := []invalidParameterValue{
+		{
+			Value:        "invalid",
+			ErrorMessage: `{"Result":"error","ErrorMessage":"invalid value in header allowedDownloads supplied","ErrorCode":4}`,
+			StatusCode:   400,
+		},
+	}
+	testInvalidParameters(t, apiUrl, apiKey.Id, validHeader, headerAllowedDownloads, invalidParameter)
 
-	data := url.Values{}
-	data.Set("id", newFileId)
+	uploadedFile, _ := uploadNewFile(t)
+	originalFile, ok := database.GetMetaDataById(uploadedFile.FileInfo.Id)
+	test.IsEqualBool(t, ok, true)
+	originalFile.DownloadCount = 20
+	originalFile.PasswordHash = "abcde"
+	database.SaveMetaData(originalFile)
+	originalFile, ok = database.GetMetaDataById(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualString(t, originalFile.Id, originalFile.Id)
+	test.IsEqualInt(t, originalFile.DownloadCount, 20)
 
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication := models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualInt(t, resultDuplication.DownloadsRemaining, 200)
-	test.IsEqualBool(t, resultDuplication.UnlimitedTime, false)
-	test.IsEqualBool(t, resultDuplication.UnlimitedDownloads, false)
-	test.IsEqualInt(t, resultDuplication.DownloadCount, 0)
-	test.IsEqualBool(t, resultDuplication.IsPasswordProtected, false)
+	for i := 0; i < 8; i++ {
+		headers := []test.Header{{Name: "id", Value: originalFile.Id}}
+		if i > 0 {
+			if i == 1 {
+				headers = append(headers, test.Header{Name: "allowedDownloads", Value: "0"})
+			} else {
+				headers = append(headers, test.Header{Name: "allowedDownloads", Value: "5"})
+			}
+		}
+		if i > 2 {
+			if i == 3 {
+				headers = append(headers, test.Header{Name: "expiryDays", Value: "0"})
+			} else {
+				headers = append(headers, test.Header{Name: "expiryDays", Value: "7"})
+			}
+		}
+		if i > 4 {
+			headers = append(headers, test.Header{Name: "password", Value: "secret"})
+		}
+		if i > 5 {
+			headers = append(headers, test.Header{Name: "originalPassword", Value: "true"})
+		}
+		if i > 6 {
+			headers = append(headers, test.Header{Name: "filename", Value: "a_new_filename"})
+		}
 
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("allowedDownloads", "100")
+		w, r := getRecorder(apiUrl, apiKey.Id, headers)
+		Process(w, r)
+		test.IsEqualInt(t, w.Code, 200)
+		output, err := io.ReadAll(w.Body)
+		test.IsNil(t, err)
 
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication = models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualInt(t, resultDuplication.DownloadsRemaining, 100)
-	test.IsEqualBool(t, resultDuplication.UnlimitedDownloads, false)
+		var outputFile models.FileApiOutput
+		err = json.Unmarshal(output, &outputFile)
+		test.IsNil(t, err)
 
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("allowedDownloads", "0")
+		newFile, ok := database.GetMetaDataById(outputFile.Id)
+		test.IsEqualBool(t, ok, true)
 
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication = models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualBool(t, resultDuplication.UnlimitedDownloads, true)
+		test.IsEqualString(t, newFile.Id, outputFile.Id)
+		test.IsEqualBool(t, newFile.Id != originalFile.Id, true)
+		if i > 6 {
+			test.IsEqualString(t, newFile.Name, "a_new_filename")
+		} else {
+			test.IsEqualString(t, newFile.Name, originalFile.Name)
+		}
+		test.IsEqualString(t, newFile.Size, originalFile.Size)
+		test.IsEqualString(t, newFile.SHA1, originalFile.SHA1)
+		test.IsEqualBool(t, originalFile.PasswordHash == newFile.PasswordHash, i != 5)
+		test.IsEqualBool(t, originalFile.ExpireAt == newFile.ExpireAt, i < 3)
+		test.IsEqualBool(t, newFile.UnlimitedTime, i == 3)
+		test.IsEqualInt64(t, originalFile.SizeBytes, newFile.SizeBytes)
+		if i > 2 {
+			test.IsEqualInt(t, newFile.DownloadsRemaining, 5)
+		}
+		if i == 0 {
+			test.IsEqualInt(t, newFile.DownloadsRemaining, 200)
+		}
+		if i == 1 {
+			test.IsEqualInt(t, newFile.DownloadsRemaining, 0)
+		}
+		test.IsEqualBool(t, newFile.UnlimitedDownloads, i == 1)
+		test.IsEqualInt(t, newFile.DownloadCount, 0)
+	}
 
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("allowedDownloads", "invalid")
-
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "strconv.Atoi: parsing \"invalid\": invalid syntax")
-
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("expiryDays", "invalid")
-
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	test.ResponseBodyContains(t, w, "strconv.Atoi: parsing \"invalid\": invalid syntax")
-
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("expiryDays", "20")
-
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication = models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualBool(t, resultDuplication.UnlimitedTime, false)
-
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("expiryDays", "0")
-
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "id", Value: "invalid"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication = models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualBool(t, resultDuplication.UnlimitedTime, true)
-
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("password", "")
-	data.Set("originalPassword", "true")
-
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication = models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualBool(t, resultDuplication.IsPasswordProtected, true)
-
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("password", "")
-
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication = models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualBool(t, resultDuplication.IsPasswordProtected, false)
-	test.IsEqualString(t, resultDuplication.Name, "fileupload.jpg")
-
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("filename", "")
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication = models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualString(t, resultDuplication.Name, "fileupload.jpg")
-
-	data = url.Values{}
-	data.Set("id", newFileId)
-	data.Set("filename", "test.test")
-	w, r = test.GetRecorder("POST", "/api/files/duplicate", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	resultDuplication = models.FileApiOutput{}
-	response, err = io.ReadAll(w.Result().Body)
-	test.IsNil(t, err)
-	err = json.Unmarshal(response, &resultDuplication)
-	test.IsNil(t, err)
-	test.IsEqualString(t, resultDuplication.Name, "test.test")
+	defer test.ExpectPanic(t)
+	apiDuplicateFile(nil, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
 }
 
 func TestChunkUpload(t *testing.T) {
+	apiKey := generateNewKey(false, idUser, "", "")
+	apiKey.GrantPermission(models.ApiPermUpload)
+	database.SaveApiKey(apiKey)
 	err := os.WriteFile("test/tmpupload", []byte("chunktestfile"), 0600)
 	test.IsNil(t, err)
 	body, formcontent := test.FileToMultipartFormBody(t, test.HttpTestConfig{
@@ -438,12 +1479,12 @@ func TestChunkUpload(t *testing.T) {
 	})
 	w, r := test.GetRecorder("POST", "/api/chunk/add", nil, []test.Header{{
 		Name:  "apikey",
-		Value: "validkey",
+		Value: apiKey.Id,
 	}}, body)
 	r.Header.Add("Content-Type", formcontent)
-	Process(w, r, maxMemory)
+	Process(w, r)
 	test.IsEqualInt(t, w.Code, 200)
-	test.ResponseBodyContains(t, w, "OK")
+	test.ResponseBodyIs(t, w, `{"result":"OK"}`)
 
 	body, formcontent = test.FileToMultipartFormBody(t, test.HttpTestConfig{
 		UploadFileName:  "test/tmpupload",
@@ -461,68 +1502,371 @@ func TestChunkUpload(t *testing.T) {
 	})
 	w, r = test.GetRecorder("POST", "/api/chunk/add", nil, []test.Header{{
 		Name:  "apikey",
-		Value: "validkey",
+		Value: apiKey.Id,
 	}}, body)
 	r.Header.Add("Content-Type", formcontent)
-	Process(w, r, maxMemory)
+	Process(w, r)
 	test.IsEqualInt(t, w.Code, 400)
-	test.ResponseBodyContains(t, w, "error")
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"strconv.ParseInt: parsing \"\": invalid syntax","ErrorCode":10}`)
+
+	defer test.ExpectPanic(t)
+	apiChunkAdd(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
 }
 
 func TestChunkComplete(t *testing.T) {
-	data := url.Values{}
-	data.Set("uuid", "tmpupload123")
-	data.Set("filename", "test.upload")
-	data.Set("filesize", "13")
+	apiKey := generateNewKey(false, idUser, "", "")
+	apiKey.GrantPermission(models.ApiPermUpload)
+	database.SaveApiKey(apiKey)
 
 	w, r := test.GetRecorder("POST", "/api/chunk/complete", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
+		{Name: "apikey", Value: apiKey.Id},
+		{Name: "uuid", Value: "tmpupload123"},
+		{Name: "filename", Value: "test.upload"},
+		{Name: "filesize", Value: "13"}},
+		nil)
+	Process(w, r)
 	test.IsEqualInt(t, w.Code, 200)
 	result := struct {
 		FileInfo models.FileApiOutput `json:"FileInfo"`
 	}{}
 	response, err := io.ReadAll(w.Result().Body)
-	fmt.Println(string(response))
 	test.IsNil(t, err)
 	err = json.Unmarshal(response, &result)
 	test.IsNil(t, err)
 	test.IsEqualString(t, result.FileInfo.Name, "test.upload")
+	withinLastTwoSeconds := result.FileInfo.UploadDate >= time.Now().Add(-2*time.Second).Unix() &&
+		result.FileInfo.UploadDate <= time.Now().Unix()
+	test.IsEqualBool(t, withinLastTwoSeconds, true)
 
-	data.Set("filesize", "15")
-
-	w, r = test.GetRecorder("POST", "/api/chunk/complete", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader(data.Encode()))
-	Process(w, r, maxMemory)
-	test.IsEqualInt(t, w.Code, 400)
-	test.ResponseBodyContains(t, w, "error")
+	// data.Set("filesize", "15")
 
 	w, r = test.GetRecorder("POST", "/api/chunk/complete", nil, []test.Header{
-		{Name: "apikey", Value: "validkey"},
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
-		strings.NewReader("invalid&&§$%"))
-	Process(w, r, maxMemory)
+		{Name: "apikey", Value: apiKey.Id},
+		{Name: "uuid", Value: "tmpupload123"},
+		{Name: "filename", Value: "test.upload"},
+		{Name: "filesize", Value: "15"}}, nil)
+	Process(w, r)
 	test.IsEqualInt(t, w.Code, 400)
-	test.ResponseBodyContains(t, w, "error")
+	test.ResponseBodyIs(t, w, `{"Result":"error","ErrorMessage":"chunk file does not exist","ErrorCode":0}`)
+
+	defer test.ExpectPanic(t)
+	apiChunkComplete(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
 }
 
-func TestList(t *testing.T) {
-	w, r := test.GetRecorder("GET", "/api/files/list", nil, []test.Header{{
-		Name:  "apikey",
-		Value: "validkey",
-	}}, nil)
-	Process(w, r, maxMemory)
+func TestMinorFunctions(t *testing.T) {
+	outputFileJson(nil, models.File{})
+	sendError(nil, 0, 0, "none")
+}
+
+func testReplaceFileCall(t *testing.T, apiKey models.ApiKey, fileTarget, fileOrigin string, deleteFile bool, resultCode int, expectedResponse string) {
+	t.Helper()
+	const apiUrl = "/files/replace"
+	const headerFileIdTarget = "id"
+	const headerFileIdOrigin = "idNewContent"
+	const headerDeleteFile = "deleteNewFile"
+	headers := []test.Header{{}}
+	if fileTarget != "" {
+		headers = append(headers, test.Header{Name: headerFileIdTarget, Value: fileTarget})
+	}
+	if fileOrigin != "" {
+		headers = append(headers, test.Header{Name: headerFileIdOrigin, Value: fileOrigin})
+	}
+	if deleteFile {
+		headers = append(headers, test.Header{Name: headerDeleteFile, Value: "true"})
+	}
+	w, r := getRecorder(apiUrl, apiKey.Id, headers)
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, resultCode)
+	if expectedResponse != "" {
+		test.ResponseBodyIs(t, w, expectedResponse)
+	}
+
+	defer test.ExpectPanic(t)
+	apiReplaceFile(w, &paramAuthCreate{}, models.User{Id: 7}, apiKey)
+}
+
+func TestFileReplace(t *testing.T) {
+	originalFile := models.File{
+		Id:                 "originalfiletest",
+		Name:               "old.txt",
+		Size:               "1KB",
+		SHA1:               "replacetest1",
+		ContentType:        "text/plain",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		AwsBucket:          "",
+		SizeBytes:          1024,
+		UserId:             idUser,
+		Encryption: models.EncryptionInfo{
+			IsEncrypted:         false,
+			IsEndToEndEncrypted: false,
+			DecryptionKey:       nil,
+			Nonce:               nil,
+		},
+	}
+
+	newFile := models.File{
+		Id:                 "newfiletest",
+		Name:               "new.txt",
+		Size:               "2KB",
+		SHA1:               "replacetest2",
+		ContentType:        "text/plain2",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		UserId:             idUser,
+		AwsBucket:          "",
+		SizeBytes:          2048,
+		Encryption: models.EncryptionInfo{
+			IsEncrypted:         true,
+			IsEndToEndEncrypted: false,
+			DecryptionKey:       []byte("key"),
+			Nonce:               []byte("nonce"),
+		},
+	}
+
+	e2eFile := models.File{
+		Id:                 "e2eFile",
+		Name:               "e2eFile",
+		Size:               "1KB",
+		UnlimitedDownloads: true,
+		UserId:             idUser,
+		UnlimitedTime:      true,
+		SHA1:               "replacetest3",
+		Encryption: models.EncryptionInfo{
+			IsEncrypted:         true,
+			IsEndToEndEncrypted: true,
+		},
+	}
+	adminFile := models.File{
+		Id:                 "adminfile",
+		Name:               "old.txt",
+		Size:               "1KB",
+		SHA1:               "replacetest1",
+		ContentType:        "text/plain",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		AwsBucket:          "",
+		SizeBytes:          1024,
+		UserId:             idAdmin,
+		Encryption: models.EncryptionInfo{
+			IsEncrypted:         false,
+			IsEndToEndEncrypted: false,
+			DecryptionKey:       nil,
+			Nonce:               nil,
+		},
+	}
+
+	database.SaveMetaData(originalFile)
+	_, ok := database.GetMetaDataById(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	database.SaveMetaData(newFile)
+	_, ok = database.GetMetaDataById(newFile.Id)
+	test.IsEqualBool(t, ok, true)
+	database.SaveMetaData(e2eFile)
+	_, ok = database.GetMetaDataById(e2eFile.Id)
+	test.IsEqualBool(t, ok, true)
+	database.SaveMetaData(adminFile)
+	_, ok = database.GetMetaDataById(adminFile.Id)
+	test.IsEqualBool(t, ok, true)
+
+	apiKey := testAuthorisation(t, "/files/replace", models.ApiPermReplace)
+	testReplaceFileCall(t, apiKey, "", "invalid", false, 400, `{"Result":"error","ErrorMessage":"header id is required","ErrorCode":4}`)
+	testReplaceFileCall(t, apiKey, "invalid", "", false, 400, `{"Result":"error","ErrorMessage":"header idNewContent is required","ErrorCode":4}`)
+	testReplaceFileCall(t, apiKey, "invalid", originalFile.Id, false, 404, `{"Result":"error","ErrorMessage":"Invalid id provided.","ErrorCode":5}`)
+	testReplaceFileCall(t, apiKey, originalFile.Id, "invalid", false, 404, `{"Result":"error","ErrorMessage":"Invalid id provided.","ErrorCode":5}`)
+	testReplaceFileCall(t, apiKey, originalFile.Id, adminFile.Id, false, 401, `{"Result":"error","ErrorMessage":"No permission to duplicate this file","ErrorCode":6}`)
+	testReplaceFileCall(t, apiKey, adminFile.Id, originalFile.Id, false, 401, `{"Result":"error","ErrorMessage":"No permission to replace this file","ErrorCode":6}`)
+	testReplaceFileCall(t, apiKey, e2eFile.Id, originalFile.Id, false, 400, `{"Result":"error","ErrorMessage":"End-to-End encrypted files cannot be replaced","ErrorCode":17}`)
+	testReplaceFileCall(t, apiKey, originalFile.Id, newFile.Id, false, 200, "")
+
+	file, ok := database.GetMetaDataById(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualString(t, file.Name, newFile.Name)
+	test.IsEqualString(t, file.SHA1, newFile.SHA1)
+	test.IsEqualString(t, file.ContentType, newFile.ContentType)
+	test.IsEqualString(t, file.AwsBucket, newFile.AwsBucket)
+	test.IsEqualString(t, file.Size, newFile.Size)
+	test.IsEqualInt64(t, file.SizeBytes, newFile.SizeBytes)
+	test.IsEqual(t, file.Encryption, newFile.Encryption)
+	_, ok = storage.GetFile(newFile.Id)
+	test.IsEqualBool(t, ok, true)
+
+	apiKey.RemovePermission(models.ApiPermDelete)
+	database.SaveApiKey(apiKey)
+	testReplaceFileCall(t, apiKey, originalFile.Id, newFile.Id, true, 401, `{"Result":"error","ErrorMessage":"No permission to delete original file","ErrorCode":6}`)
+	testReplaceFileCall(t, apiKey, originalFile.Id, adminFile.Id, true, 401, `{"Result":"error","ErrorMessage":"No permission to duplicate this file","ErrorCode":6}`)
+
+	apiKey.GrantPermission(models.ApiPermDelete)
+	database.SaveApiKey(apiKey)
+	user, _ := database.GetUser(idUser)
+	user.GrantPermission(models.UserPermListOtherUploads)
+	user.RemovePermission(models.UserPermDeleteOtherUploads)
+	database.SaveUser(user, false)
+	testReplaceFileCall(t, apiKey, originalFile.Id, adminFile.Id, true, 401, `{"Result":"error","ErrorMessage":"No permission to delete original file","ErrorCode":6}`)
+
+	user.GrantPermission(models.UserPermDeleteOtherUploads)
+	database.SaveUser(user, false)
+	testReplaceFileCall(t, apiKey, originalFile.Id, adminFile.Id, true, 200, "")
+	_, ok = storage.GetFile(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	_, ok = storage.GetFile(adminFile.Id)
+	test.IsEqualBool(t, ok, false)
+
+	user.RemovePermission(models.UserPermDeleteOtherUploads)
+	database.SaveUser(user, false)
+	testReplaceFileCall(t, apiKey, originalFile.Id, newFile.Id, true, 200, "")
+	_, ok = storage.GetFile(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	_, ok = storage.GetFile(newFile.Id)
+	test.IsEqualBool(t, ok, false)
+}
+
+func TestChunkCompleteSanitisation(t *testing.T) {
+	apiKey := generateNewKey(false, idUser, "", "")
+	apiKey.GrantPermission(models.ApiPermUpload)
+	database.SaveApiKey(apiKey)
+
+	dangerousCases := []struct {
+		name        string
+		filename    string
+		contentType string
+	}{
+		{
+			name:        "path traversal in filename",
+			filename:    "../../etc/passwd",
+			contentType: "text/plain",
+		},
+		{
+			name:        "CRLF injection in filename",
+			filename:    "upload.txt\r\nSet-Cookie: session=evil",
+			contentType: "text/plain",
+		},
+		{
+			name:        "null byte in filename",
+			filename:    "file\x00.txt",
+			contentType: "text/plain",
+		},
+		{
+			name:        "CRLF injection in content-type",
+			filename:    "upload.txt",
+			contentType: "text/plain\r\nX-Injected: evil",
+		},
+		{
+			name:        "null byte in content-type",
+			filename:    "upload.txt",
+			contentType: "text/plain\x00evil",
+		},
+	}
+
+	for _, tc := range dangerousCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Write a temporary chunk file for the upload to succeed.
+			chunkUUID := "sanitisetest123"
+			err := os.WriteFile("test/data/chunk-"+chunkUUID, []byte("testcontent"), 0600)
+			test.IsNil(t, err)
+
+			w, r := test.GetRecorder("POST", "/api/chunk/complete", nil, []test.Header{
+				{Name: "apikey", Value: apiKey.Id},
+				{Name: "uuid", Value: chunkUUID},
+				{Name: "filename", Value: tc.filename},
+				{Name: "filesize", Value: "11"},
+				{Name: "contenttype", Value: tc.contentType},
+			}, nil)
+			Process(w, r)
+			test.IsEqualInt(t, w.Code, 200)
+
+			// Parse the returned file metadata.
+			result := struct {
+				FileInfo models.FileApiOutput `json:"FileInfo"`
+			}{}
+			err = json.Unmarshal(w.Body.Bytes(), &result)
+			test.IsNil(t, err)
+
+			// The stored filename must not contain any dangerous sequences.
+			storedName := result.FileInfo.Name
+			test.IsEqualBool(t, strings.HasPrefix(storedName, ".."), false)
+			test.IsEqualBool(t, strings.Contains(storedName, "\r"), false)
+			test.IsEqualBool(t, strings.Contains(storedName, "\n"), false)
+			test.IsEqualBool(t, strings.Contains(storedName, "\x00"), false)
+		})
+	}
+}
+
+func TestChunkUploadRequestCompleteSanitisation(t *testing.T) {
+	apiKey := generateNewKey(false, idUser, "", "")
+	apiKey.GrantPermission(models.ApiPermUpload)
+	database.SaveApiKey(apiKey)
+
+	// paramChunkUploadRequestComplete already calls both sanitisers.
+	// Verify end-to-end that dangerous filenames and content-types submitted
+	// through /chunk/upload-request/complete are cleaned before storage.
+	p := &paramChunkUploadRequestComplete{}
+	p.foundHeaders = map[string]bool{}
+	p.FileName = "../../etc/passwd\r\nSet-Cookie: x=1"
+	p.ContentType = "text/plain\r\nX-Evil: header"
+	p.FileSize = 10
+	err := p.ProcessParameter(nil)
+	test.IsNil(t, err)
+
+	test.IsEqualBool(t, strings.HasPrefix(p.FileName, ".."), false)
+	test.IsEqualBool(t, strings.Contains(p.FileName, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(p.FileName, "\n"), false)
+	test.IsEqualBool(t, strings.Contains(p.ContentType, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(p.ContentType, "\n"), false)
+	// Sanitised values must propagate into FileHeader.
+	test.IsEqualString(t, p.FileHeader.Filename, p.FileName)
+	test.IsEqualString(t, p.FileHeader.ContentType, p.ContentType)
+}
+
+func TestFilesDuplicateSanitisation(t *testing.T) {
+	apiKey := generateNewKey(false, idUser, "", "")
+	apiKey.GrantPermission(models.ApiPermUpload)
+	database.SaveApiKey(apiKey)
+
+	const apiUrl = "/files/duplicate"
+
+	// Path traversal in the new filename for a duplicate must be sanitised.
+	w, r := getRecorder(apiUrl, apiKey.Id, []test.Header{
+		{Name: "id", Value: idFileUser},
+		{Name: "filename", Value: "../../etc/shadow"},
+	})
+	Process(w, r)
 	test.IsEqualInt(t, w.Code, 200)
-	test.ResponseBodyContains(t, w, "picture.jpg")
+	var output models.FileApiOutput
+	err := json.Unmarshal(w.Body.Bytes(), &output)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.HasPrefix(output.Name, ".."), false)
+	test.IsEqualBool(t, strings.Contains(output.Name, "/"), false)
+
+	// CRLF in the duplicate filename must be stripped.
+	w, r = getRecorder(apiUrl, apiKey.Id, []test.Header{
+		{Name: "id", Value: idFileUser},
+		{Name: "filename", Value: "file.txt\r\nX-Evil: injected"},
+	})
+	Process(w, r)
+	test.IsEqualInt(t, w.Code, 200)
+	err = json.Unmarshal(w.Body.Bytes(), &output)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.Contains(output.Name, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(output.Name, "\n"), false)
 }
 
-func TestApiRequestToUploadRequest(t *testing.T) {
-	_, r := test.GetRecorder("POST", "/api/chunk/complete", nil, []test.Header{
-		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}}, strings.NewReader("invalid&&§$%"))
-	_, _, _, err := apiRequestToUploadRequest(r)
-	test.IsNotNil(t, err)
+func TestChunkCompleteSanitisationUnit(t *testing.T) {
+	p := &paramChunkComplete{}
+	p.foundHeaders = map[string]bool{"realsize": true}
+	p.RealSize = 10
+	p.FileSize = 10
+	p.AllowedDownloads = 1
+	p.ExpiryDays = 14
+	p.ContentType = "text/plain"
+	p.FileName = "../../etc/passwd\r\nSet-Cookie: x=1"
+
+	err := p.ProcessParameter(nil)
+	test.IsNil(t, err)
+
+	// The FileHeader must receive the sanitised filename, not the raw one.
+	test.IsEqualString(t, p.FileHeader.Filename, p.FileName)
+	test.IsEqualBool(t, strings.HasPrefix(p.FileHeader.Filename, ".."), false)
+	test.IsEqualBool(t, strings.Contains(p.FileHeader.Filename, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(p.FileHeader.Filename, "\n"), false)
 }

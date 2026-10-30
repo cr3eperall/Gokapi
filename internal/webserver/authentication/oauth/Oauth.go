@@ -2,15 +2,17 @@ package oauth
 
 import (
 	"context"
+	"log"
+	"net/http"
+	"time"
+
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/forceu/gokapi/internal/configuration"
 	"github.com/forceu/gokapi/internal/helper"
 	"github.com/forceu/gokapi/internal/models"
 	"github.com/forceu/gokapi/internal/webserver/authentication"
+	"github.com/forceu/gokapi/internal/webserver/errorHandling"
 	"golang.org/x/oauth2"
-	"log"
-	"net/http"
-	"time"
 )
 
 var config oauth2.Config
@@ -27,10 +29,7 @@ func Init(baseUrl string, credentials models.AuthenticationConfig) {
 	}
 
 	systemConfig := configuration.Get()
-	scopes := []string{oidc.ScopeOpenID, "profile"}
-	if systemConfig.Authentication.OAuthUserScope != "" {
-		scopes = append(scopes, systemConfig.Authentication.OAuthUserScope)
-	}
+	scopes := []string{oidc.ScopeOpenID, "profile", "email"}
 	if systemConfig.Authentication.OAuthGroupScope != "" {
 		scopes = append(scopes, systemConfig.Authentication.OAuthGroupScope)
 	}
@@ -44,57 +43,83 @@ func Init(baseUrl string, credentials models.AuthenticationConfig) {
 	}
 }
 
+const (
+	promptSilent = iota
+	promptSelectAccount
+	promptConsent
+)
+
 // HandlerLogin is a handler for showing the login screen
-func HandlerLogin(w http.ResponseWriter, r *http.Request) { // If user clicked logout, force consent
-	initLogin(w, r, r.URL.Query().Has("consent"))
+func HandlerLogin(w http.ResponseWriter, r *http.Request) {
+	// If user clicked logout, force account selection
+	if r.URL.Query().Has("consent") {
+		initLogin(w, r, promptConsent)
+		return
+	}
+	initLogin(w, r, promptSilent)
 }
 
-func initLogin(w http.ResponseWriter, r *http.Request, showConsentScreen bool) {
-	state := helper.GenerateRandomString(16)
+func initLogin(w http.ResponseWriter, r *http.Request, screenType int) {
+	state := helper.GenerateRandomString(32)
 	setCallbackCookie(w, state)
-	prompt := "none"
-	if showConsentScreen {
+	var prompt string
+	switch screenType {
+	case promptSilent:
+		prompt = "none"
+	case promptSelectAccount:
+		prompt = "select_account"
+	case promptConsent:
 		prompt = "consent"
+	default:
+		panic("invalid screen type")
 	}
 	http.Redirect(w, r, config.AuthCodeURL(state)+"&prompt="+prompt, http.StatusFound)
 }
 
+func isConsentRequired(r *http.Request) bool {
+	return r.URL.Query().Get("error") == "consent_required"
+}
+
 func isLoginRequired(r *http.Request) bool {
-	errorsRequiringLogin := []string{"login_required", "consent_required", "interaction_required"}
 	errorCode := r.URL.Query().Get("error")
-	for _, possibleError := range errorsRequiringLogin {
-		if errorCode == possibleError {
-			return true
-		}
-	}
-	return false
+	return errorCode == "login_required" || errorCode == "interaction_required"
 }
 
 // HandlerCallback is a handler for processing the oauth callback
 func HandlerCallback(w http.ResponseWriter, r *http.Request) {
 	state, err := r.Cookie(authentication.CookieOauth)
 	if err != nil {
-		showOauthErrorPage(w, r, "Parameter state was not provided")
+		errorHandling.RedirectToOAuthErrorPage(w, r, "Parameter state was not provided", err)
 		return
 	}
 	if r.URL.Query().Get("state") != state.Value {
-		showOauthErrorPage(w, r, "Parameter state did not match")
+		errorHandling.RedirectToOAuthErrorPage(w, r, "Parameter state did not match", err)
+		return
+	}
+
+	if isConsentRequired(r) {
+		initLogin(w, r, promptConsent)
+		return
+	}
+	if isLoginRequired(r) {
+		initLogin(w, r, promptSelectAccount)
 		return
 	}
 
 	oauth2Token, err := config.Exchange(ctx, r.URL.Query().Get("code"))
 	if err != nil {
-		if isLoginRequired(r) {
-			initLogin(w, r, true)
-			return
-		}
-		showOauthErrorPage(w, r, "Failed to exchange token: "+err.Error())
+		errorHandling.RedirectToOAuthErrorPage(w, r, "Failed to exchange token", err)
 		return
 	}
 
 	userInfo, err := provider.UserInfo(ctx, oauth2.StaticTokenSource(oauth2Token))
 	if err != nil {
-		showOauthErrorPage(w, r, "Failed to get userinfo: "+err.Error())
+		errorHandling.RedirectToOAuthErrorPage(w, r, "Failed to get user info", err)
+		return
+	}
+	if userInfo.Email == "" {
+		errorHandling.RedirectToOAuthErrorPage(w, r, "An empty email address was provided.\nPlease make sure that you have your"+
+			" email address set in your authentication user backend.", nil)
 		return
 	}
 	info := authentication.OAuthUserInfo{
@@ -102,18 +127,10 @@ func HandlerCallback(w http.ResponseWriter, r *http.Request) {
 		Email:      userInfo.Email,
 		ClaimsSent: userInfo,
 	}
-	err = authentication.CheckOauthUserAndRedirect(info, w)
+	err = authentication.CheckOauthUserAndRedirect(w, r, info)
 	if err != nil {
-		showOauthErrorPage(w, r, "Failed to extract scope value: "+err.Error())
+		errorHandling.RedirectToOAuthErrorPage(w, r, "Failed to continue with login: ", err)
 	}
-}
-
-func showOauthErrorPage(w http.ResponseWriter, r *http.Request, errorMessage string) {
-	// Extract the query parameters from the original URL
-	queryParams := r.URL.Query()
-	queryParams.Add("error_generic", errorMessage)
-	redirectURL := "./error-oauth?" + queryParams.Encode()
-	http.Redirect(w, r, redirectURL, http.StatusSeeOther)
 }
 
 func setCallbackCookie(w http.ResponseWriter, value string) {
@@ -122,6 +139,7 @@ func setCallbackCookie(w http.ResponseWriter, value string) {
 		Value:    value,
 		MaxAge:   int(time.Hour.Seconds()),
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(w, c)
 }

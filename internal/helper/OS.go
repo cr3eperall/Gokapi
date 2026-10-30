@@ -6,11 +6,12 @@ Simplified OS functions
 
 import (
 	"bufio"
-	"errors"
-	"golang.org/x/term"
+	"crypto/subtle"
 	"log"
 	"os"
 	"syscall"
+
+	"golang.org/x/term"
 )
 
 // FolderExists returns true if a folder exists
@@ -23,12 +24,15 @@ func FolderExists(folder string) bool {
 }
 
 // FileExists returns true if a file exists
-func FileExists(filename string) bool {
+func FileExists(filename string) (bool, error) {
 	info, err := os.Stat(filename)
 	if os.IsNotExist(err) {
-		return false
+		return false, nil
 	}
-	return !info.IsDir()
+	if err != nil {
+		return false, err
+	}
+	return !info.IsDir(), nil
 }
 
 // CreateDir creates the data folder if it does not exist
@@ -95,8 +99,7 @@ func GetFileSize(file *os.File) (int64, error) {
 	return fileInfo.Size(), nil
 }
 
-// ErrPathDoesNotExist is raised if the requested path does not exist
-var ErrPathDoesNotExist = errors.New("path does not exist")
-
-// ErrPathIsNotDir is raised if the requested path is not a directory
-var ErrPathIsNotDir = errors.New("path is not a directory")
+// IsEqualStringConstantTime uses ConstantTimeCompare to prevent timing attack.
+func IsEqualStringConstantTime(s1, s2 string) bool {
+	return subtle.ConstantTimeCompare([]byte(s1), []byte(s2)) == 1
+}

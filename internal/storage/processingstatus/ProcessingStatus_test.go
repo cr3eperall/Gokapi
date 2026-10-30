@@ -1,66 +1,57 @@
 package processingstatus
 
 import (
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/configuration/database"
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/forceu/gokapi/internal/test"
-	"github.com/forceu/gokapi/internal/test/testconfiguration"
-	"github.com/r3labs/sse/v2"
-	"os"
+	"errors"
 	"testing"
-	"time"
+
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/storage/processingstatus/pstatusdb"
+	"github.com/forceu/gokapi/internal/test"
 )
 
-func TestMain(m *testing.M) {
-	testconfiguration.Create(false)
-	configuration.Load()
-	exitVal := m.Run()
-	testconfiguration.Delete()
-	os.Exit(exitVal)
+func TestSetStatus(t *testing.T) {
+	const id = "testchunk"
+
+	status, ok := getStatus(id)
+	test.IsEqualBool(t, ok, false)
+	test.IsEmpty(t, status.ChunkId)
+
+	// pstatusdb.Set is synchronous — state is committed before Set returns,
+	// so no synchronisation is needed to read it back.
+	// The goroutines spawned by Set (sse.PublishNewStatus and pstatusdb's GC)
+	// are fire-and-forget and do not affect the assertions below.
+	// Note: synctest.Test cannot be used here because pstatusdb.Set starts a
+	// long-running GC goroutine (via sync.Once) that sleeps for 1 hour and
+	// recurses, which permanently blocks the synctest bubble from resolving.
+	Set(id, 2, models.File{Id: "testfile"}, 1, nil)
+	status, ok = getStatus(id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualString(t, status.ChunkId, id)
+	test.IsEqualString(t, status.FileId, "testfile")
+	test.IsEqualInt(t, status.CurrentStatus, 2)
+
+	// Lower status must not overwrite a higher one
+	Set(id, 1, models.File{}, 1, nil)
+	status, ok = getStatus(id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualString(t, status.ChunkId, id)
+	test.IsEqualInt(t, status.CurrentStatus, 2)
+
+	// Error status must be stored including the error message
+	Set(id, 3, models.File{Id: "testfile"}, 1, errors.New("test"))
+	status, ok = getStatus(id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualString(t, status.ChunkId, id)
+	test.IsEqualInt(t, status.CurrentStatus, 3)
+	test.IsEqualString(t, status.FileId, "testfile")
+	test.IsEqualString(t, status.ErrorMessage, "test")
 }
 
-func TestSetStatus(t *testing.T) {
-
-	Init(sse.New())
-
-	chunkID := "testChunkID"
-	testCases := []struct {
-		name          string
-		initialStatus int
-		newStatus     int
-	}{
-		{"SetNewStatus", -1, StatusHashingOrEncrypting},
-		{"SetSameStatus", StatusUploading, StatusUploading},
-		// Add more test cases as needed
+func getStatus(id string) (models.UploadStatus, bool) {
+	for _, status := range pstatusdb.GetAllForUser(1) {
+		if status.ChunkId == id {
+			return status, true
+		}
 	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Set the initial status for the chunk ID
-			initialStatus := models.UploadStatus{
-				ChunkId:       chunkID,
-				CurrentStatus: tc.initialStatus,
-				LastUpdate:    time.Now().Unix(),
-			}
-			database.SaveUploadStatus(initialStatus)
-
-			// Set the new status
-			Set(chunkID, tc.newStatus)
-
-			// Wait for SSE event to be published
-			time.Sleep(100 * time.Millisecond)
-
-			// Retrieve the updated status from the database
-			updatedStatus, _ := database.GetUploadStatus(chunkID)
-
-			// Check if the status was updated
-			test.IsEqualInt(t, tc.newStatus, updatedStatus.CurrentStatus)
-		})
-	}
-
-	sseServer = nil
-	defer test.ExpectPanic(t)
-	passNewStatus(models.UploadStatus{})
-
+	return models.UploadStatus{}, false
 }

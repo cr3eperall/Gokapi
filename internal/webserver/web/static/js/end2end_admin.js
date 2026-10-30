@@ -1,15 +1,17 @@
-Blob.prototype.arrayBuffer ??= function() {
-    return new Response(this).arrayBuffer()
-}
-isE2EEnabled = true;
-
-
 function displayError(err) {
     document.getElementById("errordiv").style.display = "block";
-    document.getElementById("errormessage").innerHTML = "<b>Error: </b> " + err.toString().replace(/^Error:/gi, "");
-    console.error('Caught exception', err)
-}
+    const errorMessageEl = document.getElementById("errormessage");
 
+    errorMessageEl.innerText = "";
+    const bold = document.createElement("b");
+    bold.innerText = "Error: ";
+    const message = document.createTextNode(err.toString().replace(/^Error:/gi, ""));
+
+    errorMessageEl.appendChild(bold);
+    errorMessageEl.appendChild(message);
+
+    console.error('Caught exception', err);
+}
 
 function checkIfE2EKeyIsSet() {
     if (!isE2EKeySet()) {
@@ -23,56 +25,52 @@ function checkIfE2EKeyIsSet() {
                 return;
             }
             getE2EInfo();
-            GokapiE2EDecryptMenu();
             dropzoneObject.enable();
-            document.getElementsByClassName("dz-button")[0].innerText = "Drop files, paste or click here to upload (end-to-end encrypted)";
+            document.getElementById("uploadBoxTitle").innerText = "Drag & drop files here";
+            document.getElementById("uploadBoxSubtitle").innerText = "or paste or click to upload with end-to-end encryption";
         });
     }
 }
 
 function getE2EInfo() {
-    var xhr = new XMLHttpRequest();
-    xhr.open("GET", "./e2eInfo?action=get", false);
-    xhr.onreadystatechange = function() {
-        if (this.readyState == 4) {
-            if (this.status == 200) {
-                let err = GokapiE2EInfoParse(xhr.response);
-                if (err !== null) {
-                    displayError(err);
-                    if (err.message === "cipher: message authentication failed") {
-                        invalidCipherRedirectConfim();
-                    }
-                }
+    apiE2eMutexLockUnlock(false)
+        .then(() => apiE2eGet())
+        .then(data => {
+            let err = GokapiE2EInfoParse(data);
+            if (err === null) {
+                GokapiE2EDecryptMenu();
             } else {
-                displayError("Trying to get E2E info: " + xhr.statusText);
+                displayError(err);
+                if (err.message === "cipher: message authentication failed") {
+                    invalidCipherRedirectConfim();
+                } else {
+                    displayError("Trying to get E2E info: " + data);
+                }
             }
-        }
-    };
-
-    xhr.send();
+        })
+        .catch(error => {
+            displayError("Trying to get E2E info: " + error);
+        })
+        .finally(() => {
+            apiE2eMutexLockUnlock(true).catch(error => {
+                console.error("Failed to release E2E mutex after read: " + error);
+            });
+        });
 }
+
+
+function storeE2EInfo(data) {
+    apiE2eStore(data)
+        .catch(error => {
+            displayError("Trying to store E2E info: " + error);
+        });
+}
+
 
 function invalidCipherRedirectConfim() {
     if (confirm('It appears that an invalid end-to-end encryption key has been entered. Would you like to enter the correct one?')) {
         window.location = './e2eSetup';
     }
-}
-
-function storeE2EInfo(data) {
-    var xhr = new XMLHttpRequest();
-    xhr.open("POST", "./e2eInfo?action=store", false);
-    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-
-    xhr.onreadystatechange = function() {
-        if (this.readyState == 4) {
-            if (this.status != 200) {
-                displayError("Trying to store E2E info: " + xhr.statusText);
-            }
-        }
-    };
-    let formData = new FormData();
-    formData.append("info", data);
-    xhr.send(urlencodeFormData(formData));
 }
 
 function isE2EKeySet() {
@@ -164,32 +162,49 @@ function setE2eUpload() {
 }
 
 
-function decryptFileEntry(id, filename, cipher) {
+function decryptFileEntries(fileMap) {
     let datatable = $('#maintable').DataTable();
     const rows = datatable.rows().nodes();
 
     for (let i = 0; i < rows.length; i++) {
         const cell = datatable.cell(i, 0).node();
-        if ("cell-name-" + id === $(cell).attr("id")) {
-            datatable.cell(i, 0).data(filename);
-            let urlNode = datatable.cell(i, 5).node();
-            let urlLink = urlNode.querySelector("a");
-            let url = urlLink.getAttribute("href");
-            if (!url.includes(cipher)) {
-                urlLink.setAttribute("href", url + "#" + cipher);
-            }
-            datatable.cell(i, 5).node(urlNode);
+        const idAttr = $(cell).attr("id");
+        if (!idAttr) continue;
 
 
-            let buttonNode = datatable.cell(i, 6).node();
-            let button = buttonNode.querySelector("button");
-            let urlButton = button.getAttribute("data-clipboard-text");
-            if (!urlButton.includes(cipher)) {
-                button.setAttribute("data-clipboard-text", urlButton + "#" + cipher);
+        const id = idAttr.substring("cell-name-".length);
+        const entry = fileMap[id];
+        if (!entry) continue; // no matching file for this row
+
+        const filename = entry[0];
+        const cipher = entry[1];
+
+        // Column 0: filename
+        cell.textContent = filename;
+
+        // Column 5: update link
+        let urlNode = datatable.cell(i, 5).node();
+        let urlLink = urlNode.querySelector("a");
+        let url = urlLink.getAttribute("href");
+
+        if (!url.includes(cipher)) {
+            if (IncludeFilename) {
+                url = url.replace("/Encrypted%20File", "/" + encodeURIComponent(filename));
             }
-        datatable.cell(i, 6).node(buttonNode);
-        break;
+            url += "#" + cipher;
+            urlLink.setAttribute("href", url);
         }
+
+        // Column 6: update button and QR/email
+        let buttonNode = datatable.cell(i, 6).node();
+        let button = buttonNode.querySelector("button");
+        button.setAttribute("data-clipboard-text", url);
+
+        let qrElem = document.getElementById("qrcode-" + id);
+        if (qrElem) qrElem.onclick = () => showQrCode(url);
+
+        let emailElem = document.getElementById("email-" + id);
+        if (emailElem) emailElem.href = "mailto:?body=" + encodeURIComponent(url);
     }
 }
 

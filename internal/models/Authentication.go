@@ -2,19 +2,32 @@ package models
 
 // AuthenticationConfig holds configuration on how to authenticate to Gokapi admin menu
 type AuthenticationConfig struct {
-	Method               int      `json:"Method"`
-	SaltAdmin            string   `json:"SaltAdmin"`
+	Method int `json:"Method"`
+	// deprecated, only used for migration
+	SaltAdmin string `json:"SaltAdmin"`
+	// deprecated, only used for migration
 	SaltFiles            string   `json:"SaltFiles"`
 	Username             string   `json:"Username"`
-	Password             string   `json:"Password"`
 	HeaderKey            string   `json:"HeaderKey"`
 	OAuthProvider        string   `json:"OauthProvider"`
 	OAuthClientId        string   `json:"OAuthClientId"`
 	OAuthClientSecret    string   `json:"OAuthClientSecret"`
-	OAuthUserScope       string   `json:"OauthUserScope"`
 	OAuthGroupScope      string   `json:"OauthGroupScope"`
 	OAuthRecheckInterval int      `json:"OAuthRecheckInterval"`
-	HeaderUsers          []string `json:"HeaderUsers"`
 	OAuthGroups          []string `json:"OAuthGroups"`
-	OAuthUsers           []string `json:"OauthUsers"`
+	OnlyRegisteredUsers  bool     `json:"OnlyRegisteredUsers"`
 }
+
+const (
+	// AuthenticationInternal authentication method uses a user / password combination handled by Gokapi
+	AuthenticationInternal = iota
+
+	// AuthenticationOAuth2 authentication retrieves the users email with Open Connect ID
+	AuthenticationOAuth2
+
+	// AuthenticationHeader authentication relies on a header from a reverse proxy to parse the username
+	AuthenticationHeader
+
+	// AuthenticationDisabled authentication ignores all internal authentication procedures. A reverse proxy needs to restrict access
+	AuthenticationDisabled
+)

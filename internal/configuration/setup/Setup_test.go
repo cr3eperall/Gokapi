@@ -5,14 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/configuration/cloudconfig"
-	"github.com/forceu/gokapi/internal/configuration/database"
-	"github.com/forceu/gokapi/internal/environment"
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/forceu/gokapi/internal/test"
-	"github.com/forceu/gokapi/internal/test/testconfiguration"
-	"github.com/forceu/gokapi/internal/webserver/authentication"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -22,6 +15,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/configuration/cloudconfig"
+	"github.com/forceu/gokapi/internal/configuration/database"
+	"github.com/forceu/gokapi/internal/environment"
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/test"
+	"github.com/forceu/gokapi/internal/test/testconfiguration"
 )
 
 var jsonForms []jsonFormObject
@@ -35,6 +36,10 @@ func TestMain(m *testing.M) {
 
 func TestDebugNotSet(t *testing.T) {
 	test.IsEqualBool(t, debugDisableAuth, false)
+	if debugDisableAuth {
+		fmt.Println("Debug mode is still on! Exiting test")
+		os.Exit(1)
+	}
 }
 
 func TestInputToJson(t *testing.T) {
@@ -59,26 +64,29 @@ func TestMissingSetupValues(t *testing.T) {
 	for _, invalid := range invalidInputs {
 		formObjects, err := invalid.toFormObject()
 		test.IsNil(t, err)
-		_, _, err = toConfiguration(&formObjects)
+		_, _, _, _, err = toConfiguration(&formObjects)
 		test.IsNotNilWithMessage(t, err, invalid.toJson())
 	}
 }
 
 func TestEncryptionSetup(t *testing.T) {
+	var e2eConfig configuration.End2EndReconfigParameters
 	input := createInputOAuth()
 	input.EncryptionLevel.Value = "1"
 	formObjects, err := input.toFormObject()
 	test.IsNil(t, err)
-	config, _, err = toConfiguration(&formObjects)
+	config, _, e2eConfig, _, err = toConfiguration(&formObjects)
 	test.IsNil(t, err)
 	test.IsEqualInt(t, len(config.Encryption.Cipher), 32)
 	test.IsEqualString(t, config.Encryption.Checksum, "")
+	test.IsEqualBool(t, e2eConfig.DeleteEncryptedStorage, false)
+	test.IsEqualBool(t, e2eConfig.DeleteEnd2EndEncryption, false)
 
 	input.EncryptionLevel.Value = "2"
 	input.EncryptionPassword.Value = "testpw12"
 	formObjects, err = input.toFormObject()
 	test.IsNil(t, err)
-	config, _, err = toConfiguration(&formObjects)
+	config, _, _, _, err = toConfiguration(&formObjects)
 	test.IsNil(t, err)
 	test.IsEqualString(t, string(config.Encryption.Cipher), "")
 	test.IsEqualInt(t, len(config.Encryption.Checksum), 64)
@@ -87,6 +95,7 @@ func TestEncryptionSetup(t *testing.T) {
 
 	testconfiguration.Create(false)
 	configuration.Load()
+	configuration.ConnectDatabase()
 	configuration.Get().Encryption.Level = 3
 	id := testconfiguration.WriteEncryptedFile()
 	file, ok := database.GetMetaDataById(id)
@@ -94,11 +103,10 @@ func TestEncryptionSetup(t *testing.T) {
 	test.IsEqualBool(t, file.UnlimitedTime, true)
 	formObjects, err = input.toFormObject()
 	test.IsNil(t, err)
-	config, _, err = toConfiguration(&formObjects)
+	config, _, e2eConfig, _, err = toConfiguration(&formObjects)
 	test.IsNil(t, err)
-	file, ok = database.GetMetaDataById(id)
-	test.IsEqualBool(t, ok, true)
-	test.IsEqualBool(t, file.UnlimitedTime, false)
+	test.IsEqualBool(t, e2eConfig.DeleteEncryptedStorage, true)
+	test.IsEqualBool(t, e2eConfig.DeleteEnd2EndEncryption, false)
 
 	configuration.Get().Encryption.Level = 2
 	input.EncryptionPassword.Value = "unc"
@@ -107,7 +115,7 @@ func TestEncryptionSetup(t *testing.T) {
 	test.IsEqualBool(t, ok, true)
 	formObjects, err = input.toFormObject()
 	test.IsNil(t, err)
-	config, _, err = toConfiguration(&formObjects)
+	config, _, _, _, err = toConfiguration(&formObjects)
 	test.IsNil(t, err)
 	file, ok = database.GetMetaDataById(id)
 	test.IsEqualBool(t, ok, true)
@@ -122,11 +130,10 @@ func TestEncryptionSetup(t *testing.T) {
 	test.IsEqualBool(t, ok, true)
 	formObjects, err = input.toFormObject()
 	test.IsNil(t, err)
-	config, _, err = toConfiguration(&formObjects)
+	config, _, e2eConfig, _, err = toConfiguration(&formObjects)
 	test.IsNil(t, err)
-	file, ok = database.GetMetaDataById(id)
-	test.IsEqualBool(t, ok, true)
-	test.IsEqualBool(t, file.UnlimitedTime, false)
+	test.IsEqualBool(t, e2eConfig.DeleteEncryptedStorage, true)
+	test.IsEqualBool(t, e2eConfig.DeleteEnd2EndEncryption, false)
 
 	database.Close()
 	testconfiguration.Delete()
@@ -140,7 +147,6 @@ var config = models.Configuration{
 	ServerUrl:      "",
 	RedirectUrl:    "",
 	ConfigVersion:  0,
-	LengthId:       0,
 	DataDir:        "",
 	MaxMemory:      0,
 	UseSsl:         false,
@@ -148,13 +154,13 @@ var config = models.Configuration{
 }
 
 func TestToConfiguration(t *testing.T) {
-	output, cloudConfig, err := toConfiguration(&jsonForms)
+	output, cloudConfig, _, authsettings, err := toConfiguration(&jsonForms)
 	test.IsNil(t, err)
-	test.IsEqualInt(t, output.Authentication.Method, authentication.Internal)
+	test.IsEqualInt(t, output.Authentication.Method, models.AuthenticationInternal)
 	test.IsEqualString(t, cloudConfig.Aws.KeyId, "testapi")
 	test.IsEqualString(t, output.Authentication.Username, "admin")
-	test.IsNotEqualString(t, output.Authentication.Password, "adminadmin")
-	test.IsNotEqualString(t, output.Authentication.Password, "")
+	test.IsNotEqualString(t, authsettings.PasswordInternalAuth, "adminadmin")
+	test.IsNotEqualString(t, authsettings.PasswordInternalAuth, "")
 	test.IsEqualString(t, output.RedirectUrl, "https://github.com/Forceu/Gokapi/")
 }
 
@@ -167,6 +173,17 @@ func TestVerifyPortNumber(t *testing.T) {
 func TestAddTrailingSlash(t *testing.T) {
 	test.IsEqualString(t, addTrailingSlash("test"), "test/")
 	test.IsEqualString(t, addTrailingSlash("test2/"), "test2/")
+}
+
+func TestIsPathMounted(t *testing.T) {
+	mounts := strings.NewReader("overlay / overlay rw 0 0\n/dev/vda /mnt_vol ext4 rw 0 0\n")
+	test.IsEqualBool(t, isPathMounted(mounts, "/mnt_vol/data"), true)
+
+	mounts = strings.NewReader("overlay / overlay rw 0 0\n/dev/vdb /app/data ext4 rw 0 0\n")
+	test.IsEqualBool(t, isPathMounted(mounts, "data"), true)
+
+	mounts = strings.NewReader("overlay / overlay rw 0 0\n")
+	test.IsEqualBool(t, isPathMounted(mounts, "/mnt_vol/data"), false)
 }
 
 func TestError(t *testing.T) {
@@ -189,8 +206,8 @@ func TestBasicAuth(t *testing.T) {
 
 	isAuth = false
 	isInitialSetup = false
-	username = "test"
-	password = "testpw"
+	credentialUsername = "test"
+	credentialPassword = "testpw"
 	basicAuth(continueFunc).ServeHTTP(w, r)
 	test.IsEqualBool(t, isAuth, false)
 
@@ -227,10 +244,69 @@ func TestInitialSetup(t *testing.T) {
 	test.IsEqualBool(t, isInitialSetup, true)
 }
 
+type dbFormTest struct {
+	DatabaseType   string `form:"dbtype_sel"`
+	SqliteLocation string `form:"sqlite_location"`
+	RedisLocation  string `form:"redis_location"`
+	RedisPrefix    string `form:"redis_prefix"`
+	RedisUser      string `form:"redis_user"`
+	RedisPw        string `form:"redis_password"`
+	RedisUseSsl    string `form:"redis_ssl_sel"`
+}
+
+func generateDbFormValues(input dbFormTest) []jsonFormObject {
+	result := make([]jsonFormObject, 0)
+	v := reflect.ValueOf(input)
+	t := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		result = append(result, jsonFormObject{
+			Name:  t.Field(i).Tag.Get("form"),
+			Value: v.Field(i).Interface().(string),
+		})
+	}
+	return result
+}
+
+func TestParseDatabaseSettings(t *testing.T) {
+	output := models.Configuration{}
+	input := generateDbFormValues(dbFormTest{
+		DatabaseType:   "0",
+		SqliteLocation: "./data/test.sqlite",
+		RedisUseSsl:    "0",
+	})
+	expected := "sqlite://./data/test.sqlite"
+	err := parseDatabaseSettings(&output, &input)
+	test.IsNil(t, err)
+	test.IsEqualString(t, output.DatabaseUrl, expected)
+
+	input = generateDbFormValues(dbFormTest{
+		DatabaseType:  "1",
+		RedisLocation: "127.0.0.1:1234",
+		RedisUseSsl:   "0",
+	})
+	expected = "redis://127.0.0.1:1234"
+	err = parseDatabaseSettings(&output, &input)
+	test.IsNil(t, err)
+	test.IsEqualString(t, output.DatabaseUrl, expected)
+
+	input = generateDbFormValues(dbFormTest{
+		DatabaseType:  "1",
+		RedisLocation: "127.0.0.1:1234",
+		RedisPrefix:   "pre_",
+		RedisUser:     "testuser",
+		RedisPw:       "testpw",
+		RedisUseSsl:   "1",
+	})
+	expected = "redis://testuser:testpw@127.0.0.1:1234?prefix=pre_&ssl=true"
+	err = parseDatabaseSettings(&output, &input)
+	test.IsNil(t, err)
+	test.IsEqualString(t, output.DatabaseUrl, expected)
+}
+
 func TestRunConfigModification(t *testing.T) {
 	testconfiguration.Create(false)
-	username = ""
-	password = ""
+	credentialUsername = ""
+	credentialPassword = ""
 	finish := make(chan bool)
 	go func() {
 		waitForServer(t, true)
@@ -246,8 +322,8 @@ func TestRunConfigModification(t *testing.T) {
 		finish <- true
 	}()
 	RunConfigModification()
-	test.IsEqualInt(t, len(username), 6)
-	test.IsEqualInt(t, len(password), 10)
+	test.IsEqualInt(t, len(credentialUsername), 6)
+	test.IsEqualInt(t, len(credentialPassword), 10)
 	isInitialSetup = true
 	<-finish
 }
@@ -309,7 +385,7 @@ func TestIntegration(t *testing.T) {
 		ResultCode:      500,
 	})
 
-	setupValues := createInputInternalAuth()
+	setupVals := createInputInternalAuth()
 	test.HttpPageResultJson(t, test.HttpTestConfig{
 		Url:             "http://localhost:53842/setup/setupResult",
 		RequiredContent: []string{"\"result\": \"OK\""},
@@ -317,20 +393,20 @@ func TestIntegration(t *testing.T) {
 		IsHtml:          false,
 		Method:          "POST",
 		ResultCode:      200,
-		Body:            strings.NewReader(setupValues.toJson()),
+		Body:            strings.NewReader(setupVals.toJson()),
 	})
 
 	waitForServer(t, false)
 	test.FileExists(t, "test/config.json")
 	settings := configuration.Get()
+	test.IsEqualBool(t, settings.IncludeFilename, true)
 	test.IsEqualInt(t, settings.Authentication.Method, 0)
 	test.IsEqualString(t, settings.Authentication.Username, "admin")
 	test.IsEqualString(t, settings.Authentication.OAuthProvider, "")
 	test.IsEqualString(t, settings.Authentication.OAuthClientId, "")
 	test.IsEqualString(t, settings.Authentication.OAuthClientSecret, "")
-	test.IsEqualInt(t, len(settings.Authentication.OAuthUsers), 0)
+	test.IsEqualBool(t, settings.Authentication.OnlyRegisteredUsers, false)
 	test.IsEqualString(t, settings.Authentication.HeaderKey, "")
-	test.IsEqualInt(t, len(settings.Authentication.HeaderUsers), 0)
 	test.IsEqualBool(t, strings.Contains(settings.Port, "127.0.0.1"), true)
 	test.IsEqualBool(t, strings.Contains(settings.Port, ":53842"), true)
 	test.IsEqualBool(t, settings.UseSsl, false)
@@ -345,6 +421,7 @@ func TestIntegration(t *testing.T) {
 		test.IsEqualString(t, cconfig.Aws.KeyId, "testapi")
 		test.IsEqualString(t, cconfig.Aws.KeySecret, "testsecret")
 		test.IsEqualString(t, cconfig.Aws.Endpoint, "testendpoint")
+		test.IsEqualBool(t, cconfig.Aws.ProxyDownload, true)
 		test.IsEqualInt(t, cconfig.Aws.Expiration, 150)
 	}
 	test.FileExists(t, "test/cloudconfig.yml")
@@ -352,8 +429,8 @@ func TestIntegration(t *testing.T) {
 	go RunConfigModification()
 	waitForServer(t, true)
 
-	username = "test"
-	password = "testpw"
+	credentialUsername = "test"
+	credentialPassword = "testpw"
 
 	setupInput := createInputHeaderAuth()
 	test.HttpPageResultJson(t, test.HttpTestConfig{
@@ -399,19 +476,14 @@ func TestIntegration(t *testing.T) {
 
 	test.FileExists(t, "test/config.json")
 	settings = configuration.Get()
+	test.IsEqualBool(t, settings.IncludeFilename, false)
 	test.IsEqualInt(t, settings.Authentication.Method, 2)
-	test.IsEqualString(t, settings.Authentication.Username, "")
+	test.IsEqualString(t, settings.Authentication.Username, "test1")
 	test.IsEqualString(t, settings.Authentication.OAuthProvider, "")
 	test.IsEqualString(t, settings.Authentication.OAuthClientId, "")
 	test.IsEqualString(t, settings.Authentication.OAuthClientSecret, "")
-	test.IsEqualInt(t, len(settings.Authentication.OAuthUsers), 0)
 	test.IsEqualString(t, settings.Authentication.HeaderKey, "testkey")
-	headerUsers := len(settings.Authentication.HeaderUsers)
-	test.IsEqualInt(t, headerUsers, 2)
-	if headerUsers == 2 {
-		test.IsEqualString(t, settings.Authentication.HeaderUsers[0], "test1")
-		test.IsEqualString(t, settings.Authentication.HeaderUsers[1], "test2")
-	}
+	test.IsEqualBool(t, settings.Authentication.OnlyRegisteredUsers, true)
 	test.IsEqualBool(t, strings.Contains(settings.Port, "127.0.0.1"), false)
 	test.IsEqualBool(t, strings.Contains(settings.Port, ":53842"), true)
 	test.IsEqualBool(t, settings.UseSsl, true)
@@ -419,7 +491,7 @@ func TestIntegration(t *testing.T) {
 	test.IsEqualString(t, settings.ServerUrl, "http://127.0.0.1:53842/")
 	test.IsEqualString(t, settings.RedirectUrl, "https://test.com")
 	test.IsEqualBool(t, settings.PicturesAlwaysLocal, false)
-	_, ok = cloudconfig.Load()
+	cconfig, ok = cloudconfig.Load()
 	if os.Getenv("GOKAPI_AWS_BUCKET") == "" {
 		test.IsEqualBool(t, ok, false)
 	}
@@ -428,8 +500,8 @@ func TestIntegration(t *testing.T) {
 	go RunConfigModification()
 	waitForServer(t, true)
 
-	username = "test"
-	password = "testpw"
+	credentialUsername = "test"
+	credentialPassword = "testpw"
 
 	setupInput = createInputOAuth()
 	test.HttpPageResultJson(t, test.HttpTestConfig{
@@ -446,50 +518,56 @@ func TestIntegration(t *testing.T) {
 	waitForServer(t, false)
 
 	test.IsEqualBool(t, settings.PicturesAlwaysLocal, true)
+	test.IsEqualBool(t, cconfig.Aws.ProxyDownload, false)
 	test.IsEqualString(t, settings.Authentication.OAuthProvider, "provider")
 	test.IsEqualString(t, settings.Authentication.OAuthClientId, "id")
 	test.IsEqualString(t, settings.Authentication.OAuthClientSecret, "secret")
-	oauthUsers := len(settings.Authentication.OAuthUsers)
-	test.IsEqualInt(t, oauthUsers, 2)
-	if oauthUsers == 2 {
-		test.IsEqualString(t, settings.Authentication.OAuthUsers[0], "oatest1")
-		test.IsEqualString(t, settings.Authentication.OAuthUsers[1], "oatest2")
-	}
+	test.IsEqualString(t, settings.Authentication.Username, "oatest1")
+	test.IsEqualBool(t, settings.Authentication.OnlyRegisteredUsers, true)
 }
 
 type setupValues struct {
-	BindLocalhost         setupEntry `form:"localhost_sel" isBool:"true"`
-	UseSsl                setupEntry `form:"ssl_sel" isBool:"true"`
-	SaveIp                setupEntry `form:"logip_sel" isBool:"true"`
-	Port                  setupEntry `form:"port" isInt:"true"`
-	PublicName            setupEntry `form:"public_name"`
-	ExtUrl                setupEntry `form:"url"`
-	RedirectUrl           setupEntry `form:"url_redirection"`
-	AuthenticationMode    setupEntry `form:"authentication_sel" isInt:"true"`
-	AuthUsername          setupEntry `form:"auth_username"`
-	AuthPassword          setupEntry `form:"auth_pw"`
-	OAuthProvider         setupEntry `form:"oauth_provider"`
-	OAuthClientId         setupEntry `form:"oauth_id"`
-	OAuthClientSecret     setupEntry `form:"oauth_secret"`
-	OAuthAuthorisedUsers  setupEntry `form:"oauth_allowed_users"`
-	OAuthAuthorisedGroups setupEntry `form:"oauth_allowed_groups"`
-	OAuthScopeUser        setupEntry `form:"oauth_scope_users"`
-	OAuthScopeGroup       setupEntry `form:"oauth_scope_groups"`
-	OAuthRestrictUser     setupEntry `form:"oauth_restrict_users" isBool:"true"`
-	OAuthRestrictGroups   setupEntry `form:"oauth_restrict_groups" isBool:"true"`
-	OAuthRecheckInterval  setupEntry `form:"oauth_recheck_interval" isInt:"true"`
-	AuthHeaderKey         setupEntry `form:"auth_headerkey"`
-	AuthHeaderUsers       setupEntry `form:"auth_header_users"`
-	StorageSelection      setupEntry `form:"storage_sel"`
-	PicturesAlwaysLocal   setupEntry `form:"storage_sel_image"`
-	S3Bucket              setupEntry `form:"s3_bucket"`
-	S3Region              setupEntry `form:"s3_region"`
-	S3ApiKey              setupEntry `form:"s3_api"`
-	S3ApiSecret           setupEntry `form:"s3_secret"`
-	S3Endpoint            setupEntry `form:"s3_endpoint"`
-	S3Expiration 		  setupEntry `form:"s3_expiration"`
-	EncryptionLevel       setupEntry `form:"encrypt_sel" isInt:"true"`
-	EncryptionPassword    setupEntry `form:"enc_pw"`
+	BindLocalhost                 setupEntry `form:"localhost_sel" isBool:"true"`
+	UseSsl                        setupEntry `form:"ssl_sel" isBool:"true"`
+	SaveIp                        setupEntry `form:"logip_sel" isBool:"true"`
+	Port                          setupEntry `form:"port" isInt:"true"`
+	PublicName                    setupEntry `form:"public_name"`
+	ExtUrl                        setupEntry `form:"url"`
+	RedirectUrl                   setupEntry `form:"url_redirection"`
+	IncludeFilename               setupEntry `form:"showfilename_sel" isBool:"true"`
+	AuthenticationMode            setupEntry `form:"authentication_sel" isInt:"true"`
+	AuthUsername                  setupEntry `form:"auth_username"`
+	AuthPassword                  setupEntry `form:"auth_pw"`
+	OAuthProvider                 setupEntry `form:"oauth_provider"`
+	OAuthClientId                 setupEntry `form:"oauth_id"`
+	OAuthClientSecret             setupEntry `form:"oauth_secret"`
+	OAuthAuthorisedGroups         setupEntry `form:"oauth_allowed_groups"`
+	OAuthAdminUser                setupEntry `form:"oauth_admin_user"`
+	OAuthScopeGroup               setupEntry `form:"oauth_scope_groups"`
+	OAuthRestrictGroups           setupEntry `form:"oauth_restrict_groups" isBool:"true"`
+	OAuthRecheckInterval          setupEntry `form:"oauth_recheck_interval" isInt:"true"`
+	OAuthOnlyRegisteredUsers      setupEntry `form:"oauth_only_registered_users" isBool:"true"`
+	AuthHeaderKey                 setupEntry `form:"auth_headerkey"`
+	AuthHeaderAdmin               setupEntry `form:"auth_header_admin"`
+	AuthHeaderOnlyRegisteredUsers setupEntry `form:"auth_header_only_registered_users" isBool:"true"`
+	StorageSelection              setupEntry `form:"storage_sel"`
+	PicturesAlwaysLocal           setupEntry `form:"storage_sel_image"`
+	ProxyDownloads                setupEntry `form:"storage_sel_proxy"`
+	S3Bucket                      setupEntry `form:"s3_bucket"`
+	S3Region                      setupEntry `form:"s3_region"`
+	S3ApiKey                      setupEntry `form:"s3_api"`
+	S3ApiSecret                   setupEntry `form:"s3_secret"`
+	S3Endpoint                    setupEntry `form:"s3_endpoint"`
+	S3Expiration 		          setupEntry `form:"s3_expiration"`
+	EncryptionLevel               setupEntry `form:"encrypt_sel" isInt:"true"`
+	EncryptionPassword            setupEntry `form:"enc_pw"`
+	DatabaseType                  setupEntry `form:"dbtype_sel" isInt:"true"`
+	SqliteLocation                setupEntry `form:"sqlite_location"`
+	RedisLocation                 setupEntry `form:"redis_location"`
+	RedisPrefix                   setupEntry `form:"redis_prefix"`
+	RedisUser                     setupEntry `form:"redis_user"`
+	RedisPw                       setupEntry `form:"redis_password"`
+	RedisUseSsl                   setupEntry `form:"redis_ssl_sel" isBool:"true"`
 }
 
 func (s *setupValues) init() {
@@ -586,6 +664,7 @@ func createInputInternalAuth() setupValues {
 	values.BindLocalhost.Value = "1"
 	values.PublicName.Value = "Test Name"
 	values.UseSsl.Value = "0"
+	values.IncludeFilename.Value = "1"
 	values.Port.Value = "53842"
 	values.ExtUrl.Value = "http://127.0.0.1:53842/"
 	values.RedirectUrl.Value = "https://github.com/Forceu/Gokapi/"
@@ -593,6 +672,7 @@ func createInputInternalAuth() setupValues {
 	values.AuthUsername.Value = "admin"
 	values.AuthPassword.Value = "adminadmin"
 	values.StorageSelection.Value = "cloud"
+	values.ProxyDownloads.Value = "proxy"
 	values.S3Bucket.Value = "testbucket"
 	values.S3Region.Value = "testregion"
 	values.S3ApiKey.Value = "testapi"
@@ -602,9 +682,13 @@ func createInputInternalAuth() setupValues {
 	values.EncryptionLevel.Value = "0"
 	values.PicturesAlwaysLocal.Value = "nochange"
 	values.SaveIp.Value = "0"
-	values.OAuthRestrictUser.Value = "false"
+	values.OAuthOnlyRegisteredUsers.Value = "false"
 	values.OAuthRestrictGroups.Value = "false"
 	values.OAuthRecheckInterval.Value = "12"
+	values.AuthHeaderOnlyRegisteredUsers.Value = "false"
+	values.DatabaseType.Value = "0"
+	values.SqliteLocation.Value = "./test/gokapi.sqlite"
+	values.RedisUseSsl.Value = "0"
 
 	return values
 }
@@ -621,13 +705,18 @@ func createInputHeaderAuth() setupValues {
 	values.RedirectUrl.Value = "https://test.com"
 	values.AuthenticationMode.Value = "2"
 	values.AuthHeaderKey.Value = "testkey"
-	values.AuthHeaderUsers.Value = "test1 ;test2"
+	values.AuthHeaderAdmin.Value = "test1"
+	values.AuthHeaderOnlyRegisteredUsers.Value = "true"
 	values.StorageSelection.Value = "local"
 	values.EncryptionLevel.Value = "0"
 	values.SaveIp.Value = "1"
-	values.OAuthRestrictUser.Value = "false"
+	values.OAuthOnlyRegisteredUsers.Value = "false"
 	values.OAuthRestrictGroups.Value = "false"
 	values.OAuthRecheckInterval.Value = "12"
+	values.IncludeFilename.Value = "0"
+	values.DatabaseType.Value = "0"
+	values.SqliteLocation.Value = "./test/gokapi.sqlite"
+	values.RedisUseSsl.Value = "0"
 
 	return values
 }
@@ -638,14 +727,14 @@ func createInputOAuth() setupValues {
 	values.OAuthProvider.Value = "provider"
 	values.OAuthClientId.Value = "id"
 	values.OAuthClientSecret.Value = "secret"
-	values.OAuthRestrictUser.Value = "true"
+	values.OAuthOnlyRegisteredUsers.Value = "true"
 	values.OAuthRestrictGroups.Value = "true"
-	values.OAuthScopeUser.Value = "email"
-	values.OAuthAuthorisedUsers.Value = "oatest1; oatest2"
+	values.OAuthAdminUser.Value = "oatest1"
 	values.OAuthScopeGroup.Value = "groups"
 	values.OAuthAuthorisedGroups.Value = "group1; group2"
 	values.StorageSelection.Value = "local"
 	values.PicturesAlwaysLocal.Value = "local"
+	values.ProxyDownloads.Value = "default"
 	return values
 }
 

@@ -1,4 +1,4 @@
-//go:build go1.20
+//go:build go1.25
 
 package main
 
@@ -12,6 +12,10 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"syscall"
+
+	"github.com/forceu/gokapi/internal/configuration/database/migration"
+	"github.com/forceu/gokapi/internal/helper/systemd"
+	"github.com/forceu/gokapi/internal/logging/serverstats"
 
 	"github.com/forceu/gokapi/internal/configuration"
 	"github.com/forceu/gokapi/internal/configuration/cloudconfig"
@@ -30,12 +34,13 @@ import (
 )
 
 // versionGokapi is the current version in readable form.
-// Other version numbers can be modified in /build/go-generate/updateVersionNumbers.go
-const versionGokapi = "1.8.1"
+const versionGokapi = "2.2.5-dev"
 
 // The following calls update the version numbers, update documentation, minify Js/CSS and build the WASM modules
 //go:generate go run "../../build/go-generate/updateVersionNumbers.go"
 //go:generate go run "../../build/go-generate/updateProtectedUrls.go"
+//go:generate go run "../../build/go-generate/updateEnvVariables.go"
+//go:generate go run "../../build/go-generate/updateApiRouting.go"
 //go:generate go run "../../build/go-generate/buildWasm.go"
 //go:generate go run "../../build/go-generate/copyStaticFiles.go"
 //go:generate go run "../../build/go-generate/minifyStaticContent.go"
@@ -43,18 +48,28 @@ const versionGokapi = "1.8.1"
 // Main routine that is called on startup
 func main() {
 	passedFlags := flagparser.ParseFlags()
+	handleServiceInstall(passedFlags)
+	handleDbMigration(passedFlags)
+
 	showVersion(passedFlags)
 	fmt.Println(logo)
 	fmt.Println("Gokapi v" + versionGokapi + " starting")
 	setup.RunIfFirstStart()
 	configuration.Load()
-	reconfigureServer(passedFlags)
+	if !reconfigureServer(passedFlags) {
+		configuration.ConnectDatabase()
+	}
+
+	setDeploymentPassword(passedFlags)
+	checkIfUserExists()
 	encryption.Init(*configuration.Get())
 	authentication.Init(configuration.Get().Authentication)
 	createSsl(passedFlags)
 	initCloudConfig(passedFlags)
-	go storage.CleanUp(true)
-	logging.AddString("Gokapi started")
+	storage.CleanUp(true)
+	logging.LogStartup()
+	showDeprecationWarnings()
+	serverstats.Init()
 	go webserver.Start()
 
 	c := make(chan os.Signal)
@@ -67,25 +82,43 @@ func main() {
 func shutdown() {
 	fmt.Println("Shutting down...")
 	webserver.Shutdown()
+	serverstats.Shutdown()
+	logging.LogShutdown()
 	database.Close()
 }
 
 // Checks for command line arguments that have to be parsed before loading the configuration
 func showVersion(passedFlags flagparser.MainFlags) {
-	if passedFlags.ShowVersion {
-		fmt.Println("Gokapi v" + versionGokapi)
-		fmt.Println()
-		fmt.Println("Builder: " + environment.Builder)
-		fmt.Println("Build Date: " + environment.BuildTime)
-		fmt.Println("Docker Version: " + environment.IsDocker)
-		info, ok := debug.ReadBuildInfo()
-		if ok {
-			fmt.Println("Go Version: " + info.GoVersion)
-		} else {
-			fmt.Println("Go Version: unknown")
-		}
+	if !passedFlags.ShowVersion {
+		return
+	}
+	fmt.Println("Gokapi v" + versionGokapi)
+	fmt.Println()
+	fmt.Println("Builder: " + environment.Builder)
+	fmt.Println("Build Date: " + environment.BuildTime)
+	fmt.Println("Is Docker Version: " + environment.IsDocker)
+	info, ok := debug.ReadBuildInfo()
+	if ok {
+		fmt.Println("Go Version: " + info.GoVersion)
+	} else {
+		fmt.Println("Go Version: unknown")
+	}
+	if info == nil {
+		fmt.Println("Build Settings: unknown")
+	} else {
 		parseBuildSettings(info.Settings)
-		osExit(0)
+	}
+	osExit(0)
+}
+
+func showDeprecationWarnings() {
+	for _, dep := range configuration.GetEnvironment().ActiveDeprecations {
+		fmt.Println()
+		fmt.Println("WARNING, deprecated feature: " + dep.Name)
+		fmt.Println(dep.Description)
+		fmt.Println("See " + dep.DocUrl + " for more information.")
+		fmt.Println()
+		logging.LogDeprecation(dep)
 	}
 }
 
@@ -98,7 +131,7 @@ func parseBuildSettings(infos []debug.BuildSetting) {
 	lookups["GOOS"] = "Operating System"
 
 	for key, value := range lookups {
-		result := "Not found"
+		result := "None"
 		for _, buildSetting := range infos {
 			if buildSetting.Key == key {
 				result = buildSetting.Value
@@ -124,7 +157,9 @@ func initCloudConfig(passedFlags flagparser.MainFlags) {
 		fmt.Println("Saving new files to cloud storage")
 		filesystem.SetAws()
 		encLevel := configuration.Get().Encryption.Level
-		if (encLevel == encryption.FullEncryptionStored || encLevel == encryption.FullEncryptionInput) && !passedFlags.DisableCorsCheck {
+		env := environment.New()
+		corsCheckDisabled := passedFlags.DisableCorsCheck || env.DisableCorsCheck
+		if !corsCheckDisabled && (encLevel == encryption.FullEncryptionStored || encLevel == encryption.FullEncryptionInput || encLevel == encryption.EndToEndEncryption) {
 			ok, err := aws.IsCorsCorrectlySet(cConfig.Aws.Bucket, configuration.Get().ServerUrl)
 			if err != nil {
 				fmt.Println("Warning: Cannot check CORS settings. " + err.Error())
@@ -141,16 +176,57 @@ func initCloudConfig(passedFlags flagparser.MainFlags) {
 }
 
 // Checks for command line arguments that have to be parsed after loading the configuration
-func reconfigureServer(passedFlags flagparser.MainFlags) {
+func reconfigureServer(passedFlags flagparser.MainFlags) bool {
 	if passedFlags.Reconfigure {
+		logging.LogSetup()
 		setup.RunConfigModification()
+		return true
 	}
+	return false
 }
 
 func createSsl(passedFlags flagparser.MainFlags) {
 	if passedFlags.CreateSsl {
 		ssl.GenerateIfInvalidCert(configuration.Get().ServerUrl, true)
 	}
+}
+
+func checkIfUserExists() {
+	if len(database.GetAllUsers()) == 0 {
+		fmt.Println("No user found in database. Please run setup first or create user with --deployment-password")
+		os.Exit(1)
+	}
+}
+
+func handleDbMigration(passedFlags flagparser.MainFlags) {
+	if !passedFlags.Migration.DoMigration {
+		return
+	}
+	migration.Do(passedFlags.Migration)
+	osExit(0)
+}
+
+func handleServiceInstall(passedFlags flagparser.MainFlags) {
+	if passedFlags.InstallService && passedFlags.UninstallService {
+		fmt.Println("Error: Both install and uninstall flags are set.")
+		osExit(1)
+	}
+	if passedFlags.InstallService {
+		systemd.InstallService()
+		osExit(0)
+	}
+	if passedFlags.UninstallService {
+		systemd.UninstallService()
+		osExit(0)
+	}
+}
+
+func setDeploymentPassword(passedFlags flagparser.MainFlags) {
+	if passedFlags.DeploymentPassword == "" {
+		return
+	}
+	logging.LogDeploymentPassword()
+	configuration.SetDeploymentPassword(passedFlags.DeploymentPassword)
 }
 
 var osExit = os.Exit

@@ -1,34 +1,41 @@
 package setup
 
 import (
+	"bufio"
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/configuration/cloudconfig"
-	"github.com/forceu/gokapi/internal/configuration/configupgrade"
-	"github.com/forceu/gokapi/internal/configuration/database"
-	"github.com/forceu/gokapi/internal/encryption"
-	"github.com/forceu/gokapi/internal/environment"
-	"github.com/forceu/gokapi/internal/helper"
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/forceu/gokapi/internal/storage"
-	"github.com/forceu/gokapi/internal/storage/filesystem/s3filesystem/aws"
-	"github.com/forceu/gokapi/internal/webserver/authentication"
 	"html/template"
 	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/configuration/cloudconfig"
+	"github.com/forceu/gokapi/internal/configuration/configupgrade"
+	"github.com/forceu/gokapi/internal/configuration/database"
+	"github.com/forceu/gokapi/internal/configuration/database/dbabstraction"
+	"github.com/forceu/gokapi/internal/encryption"
+	"github.com/forceu/gokapi/internal/environment"
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/storage/filesystem/s3filesystem/aws"
+	"github.com/forceu/gokapi/internal/webserver/ratelimiter"
 )
 
 // webserverDir is the embedded version of the "static" folder
@@ -45,15 +52,25 @@ var templateFolderEmbedded embed.FS
 
 var srv http.Server
 var isInitialSetup = true
-var username string
-var password string
+var credentialUsername string
+var credentialPassword string
+var credentialAWSTest string
 
+// debugDisableAuth can be set to true for testing purposes. It will disable the
+// password requirement for accessing the setup page
 const debugDisableAuth = false
 
 // RunIfFirstStart checks if config files exist and if not start a blocking webserver for setup
 func RunIfFirstStart() {
 	if !configuration.Exists() {
 		isInitialSetup = true
+		credentialAWSTest = helper.GenerateRandomString(10)
+		fmt.Println()
+		fmt.Println("###################################################################")
+		fmt.Println("Use the following password for testing the AWS configuration:")
+		fmt.Println("Password:  " + credentialAWSTest)
+		fmt.Println("###################################################################")
+		fmt.Println()
 		startSetupWebserver()
 	}
 }
@@ -61,13 +78,13 @@ func RunIfFirstStart() {
 // RunConfigModification starts a blocking webserver for reconfiguration setup
 func RunConfigModification() {
 	isInitialSetup = false
-	username = helper.GenerateRandomString(6)
-	password = helper.GenerateRandomString(10)
+	credentialUsername = helper.GenerateRandomString(6)
+	credentialPassword = helper.GenerateRandomString(10)
 	fmt.Println()
 	fmt.Println("###################################################################")
 	fmt.Println("Use the following credentials for modifying the configuration:")
-	fmt.Println("Username: " + username)
-	fmt.Println("Password: " + password)
+	fmt.Println("Username: " + credentialUsername)
+	fmt.Println("Password: " + credentialPassword)
 	fmt.Println("###################################################################")
 	fmt.Println()
 	startSetupWebserver()
@@ -84,15 +101,15 @@ func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		enteredUser, enteredPw, ok := r.BasicAuth()
 		if ok {
-			usernameMatch := authentication.IsEqualStringConstantTime(enteredUser, username)
-			passwordMatch := authentication.IsEqualStringConstantTime(enteredPw, password)
+			ratelimiter.WaitOnSetupLogin()
+			usernameMatch := helper.IsEqualStringConstantTime(strings.ToLower(enteredUser), strings.ToLower(credentialUsername))
+			passwordMatch := helper.IsEqualStringConstantTime(enteredPw, credentialPassword)
 			if usernameMatch && passwordMatch {
 				next.ServeHTTP(w, r)
 				return
 			}
 		}
-		time.Sleep(time.Second)
-		w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
+		w.Header().Set("WWW-Authenticate", `Basic realm="Please enter the credentials shown in the console output", charset="UTF-8"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 	}
 }
@@ -129,7 +146,7 @@ func startSetupWebserver() {
 		log.Fatalf("Setup Webserver: %v", err)
 	}
 	err = srv.Serve(listener)
-	if err != nil && err != http.ErrServerClosed {
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("Setup Webserver: %v", err)
 	}
 }
@@ -143,10 +160,11 @@ func isErrorAddressAlreadyInUse(err error) bool {
 	if !errors.As(eOsSyscall, &errErrno) {
 		return false
 	}
-	if errErrno == syscall.EADDRINUSE {
+	if errors.Is(errErrno, syscall.EADDRINUSE) {
 		return true
 	}
 	const WSAEADDRINUSE = 10048
+	//noinspection GoBoolExpressions
 	if runtime.GOOS == "windows" && errErrno == WSAEADDRINUSE {
 		return true
 	}
@@ -154,9 +172,13 @@ func isErrorAddressAlreadyInUse(err error) bool {
 }
 
 func resolveHostIp() string {
+	const localhost = "127.0.0.1"
+	if environment.IsDockerInstance() {
+		return localhost
+	}
 	netInterfaceAddresses, err := net.InterfaceAddrs()
 	if err != nil {
-		return "127.0.0.1"
+		return localhost
 	}
 
 	for _, netInterfaceAddress := range netInterfaceAddresses {
@@ -166,7 +188,7 @@ func resolveHostIp() string {
 			return ip
 		}
 	}
-	return "127.0.0.1"
+	return localhost
 }
 
 type jsonFormObject struct {
@@ -213,18 +235,30 @@ func getFormValueInt(formObjects *[]jsonFormObject, key string) (int, error) {
 	return result, nil
 }
 
-func toConfiguration(formObjects *[]jsonFormObject) (models.Configuration, *cloudconfig.CloudConfig, error) {
+type authSettings struct {
+	UserInternalAuth          string
+	UserOAuth                 string
+	UserHeader                string
+	PasswordInternalAuth      string
+	OnlyRegisteredUsersOAuth  bool
+	OnlyRegisteredUsersHeader bool
+}
+
+func toConfiguration(formObjects *[]jsonFormObject) (models.Configuration, *cloudconfig.CloudConfig, configuration.End2EndReconfigParameters, authSettings, error) {
 	var err error
+	var e2eConfig configuration.End2EndReconfigParameters
 	parsedEnv := environment.New()
 
 	result := models.Configuration{
-		MaxFileSizeMB:  parsedEnv.MaxFileSize,
-		LengthId:       parsedEnv.LengthId,
-		MaxMemory:      parsedEnv.MaxMemory,
-		DataDir:        parsedEnv.DataDir,
-		ConfigVersion:  configupgrade.CurrentConfigVersion,
-		Authentication: models.AuthenticationConfig{},
+		MaxFileSizeMB:      parsedEnv.MaxFileSize,
+		MaxMemory:          parsedEnv.MaxMemory,
+		DataDir:            parsedEnv.DataDir,
+		MaxParallelUploads: parsedEnv.MaxParallelUploads,
+		ChunkSize:          parsedEnv.ChunkSizeMB,
+		ConfigVersion:      configupgrade.CurrentConfigVersion,
+		Authentication:     models.AuthenticationConfig{},
 	}
+	authInfo := authSettings{}
 
 	if isInitialSetup {
 		result.Authentication.SaltFiles = helper.GenerateRandomString(30)
@@ -233,46 +267,139 @@ func toConfiguration(formObjects *[]jsonFormObject) (models.Configuration, *clou
 		result.Authentication = configuration.Get().Authentication
 	}
 
-	err = parseBasicAuthSettings(&result, formObjects)
+	err = parseDatabaseSettings(&result, formObjects)
 	if err != nil {
-		return models.Configuration{}, nil, err
+		return models.Configuration{}, nil, configuration.End2EndReconfigParameters{}, authSettings{}, err
 	}
 
-	err = parseOAuthSettings(&result, formObjects)
+	err = parseBasicAuthSettings(&result, &authInfo, formObjects)
 	if err != nil {
-		return models.Configuration{}, nil, err
+		return models.Configuration{}, nil, configuration.End2EndReconfigParameters{}, authSettings{}, err
 	}
 
-	err = parseHeaderAuthSettings(&result, formObjects)
+	err = parseOAuthSettings(&result, &authInfo, formObjects)
 	if err != nil {
-		return models.Configuration{}, nil, err
+		return models.Configuration{}, nil, configuration.End2EndReconfigParameters{}, authSettings{}, err
+	}
+
+	err = parseHeaderAuthSettings(&result, &authInfo, formObjects)
+	if err != nil {
+		return models.Configuration{}, nil, configuration.End2EndReconfigParameters{}, authSettings{}, err
 	}
 
 	err = parseServerSettings(&result, formObjects)
 	if err != nil {
-		return models.Configuration{}, nil, err
+		return models.Configuration{}, nil, configuration.End2EndReconfigParameters{}, authSettings{}, err
 	}
 
-	err = parseEncryptionAndDelete(&result, formObjects)
+	e2eConfig, err = parseEncryptionAndDelete(&result, formObjects)
 	if err != nil {
-		return models.Configuration{}, nil, err
+		return models.Configuration{}, nil, configuration.End2EndReconfigParameters{}, authSettings{}, err
 	}
 
 	var cloudSettings *cloudconfig.CloudConfig
 	cloudSettings, err = parseCloudSettings(formObjects)
 	if err != nil {
-		return models.Configuration{}, nil, err
+		return models.Configuration{}, nil, configuration.End2EndReconfigParameters{}, authSettings{}, err
 	}
 
-	return result, cloudSettings, nil
+	switch result.Authentication.Method {
+	case models.AuthenticationInternal:
+		result.Authentication.Username = authInfo.UserInternalAuth
+	case models.AuthenticationOAuth2:
+		result.Authentication.Username = authInfo.UserOAuth
+		result.Authentication.OnlyRegisteredUsers = authInfo.OnlyRegisteredUsersOAuth
+	case models.AuthenticationHeader:
+		result.Authentication.Username = authInfo.UserHeader
+		result.Authentication.OnlyRegisteredUsers = authInfo.OnlyRegisteredUsersHeader
+	case models.AuthenticationDisabled:
+		result.Authentication.Username = "admin@gokapi"
+	}
+	result.Authentication.Username = strings.ToLower(result.Authentication.Username)
+
+	return result, cloudSettings, e2eConfig, authInfo, nil
 }
 
-func parseBasicAuthSettings(result *models.Configuration, formObjects *[]jsonFormObject) error {
-	var err error
-	result.Authentication.Username, err = getFormValueString(formObjects, "auth_username")
+func parseDatabaseSettings(result *models.Configuration, formObjects *[]jsonFormObject) error {
+	dbType, err := getFormValueInt(formObjects, "dbtype_sel")
 	if err != nil {
 		return err
 	}
+	err = checkForAllDbValues(formObjects)
+	if err != nil {
+		return err
+	}
+	switch dbType {
+	case dbabstraction.TypeSqlite:
+		location, err := getFormValueString(formObjects, "sqlite_location")
+		if err != nil {
+			return err
+		}
+		result.DatabaseUrl = "sqlite://" + location
+		return nil
+	case dbabstraction.TypeRedis:
+		host, err := getFormValueString(formObjects, "redis_location")
+		if err != nil {
+			return err
+		}
+		prefix, err := getFormValueString(formObjects, "redis_prefix")
+		if err != nil {
+			return err
+		}
+		rUser, err := getFormValueString(formObjects, "redis_user")
+		if err != nil {
+			return err
+		}
+		rPassword, err := getFormValueString(formObjects, "redis_password")
+		if err != nil {
+			return err
+		}
+		useSsl, err := getFormValueBool(formObjects, "redis_ssl_sel")
+		if err != nil {
+			return err
+		}
+		dbUrl := url.URL{
+			Scheme: "redis",
+			Host:   host,
+		}
+		query := url.Values{}
+		if prefix != "" {
+			query.Set("prefix", prefix)
+		}
+		if useSsl {
+			query.Set("ssl", "true")
+		}
+		if rUser != "" || rPassword != "" {
+			dbUrl.User = url.UserPassword(rUser, rPassword)
+		}
+		dbUrl.RawQuery = query.Encode()
+		result.DatabaseUrl = dbUrl.String()
+		return nil
+	default:
+		return errors.New("unsupported database selected")
+	}
+}
+
+// checkForAllDbValues tests if all values were passed, even if they were not required for this particular database
+// This is done to ensure that no invalid form was passed and makes testing easier
+func checkForAllDbValues(formObjects *[]jsonFormObject) error {
+	expectedValues := []string{"dbtype_sel", "sqlite_location", "redis_location", "redis_prefix", "redis_user", "redis_password"}
+	for _, value := range expectedValues {
+		_, err := getFormValueString(formObjects, value)
+		if err != nil {
+			return err
+		}
+	}
+	_, err := getFormValueBool(formObjects, "redis_ssl_sel")
+	return err
+}
+
+func parseBasicAuthSettings(result *models.Configuration, authInfo *authSettings, formObjects *[]jsonFormObject) error {
+	username, err := getFormValueString(formObjects, "auth_username")
+	if err != nil {
+		return err
+	}
+	authInfo.UserInternalAuth = username
 
 	pw, err := getFormValueString(formObjects, "auth_pw")
 	if err != nil {
@@ -281,20 +408,16 @@ func parseBasicAuthSettings(result *models.Configuration, formObjects *[]jsonFor
 	// Password is not displayed in reconf setup, but a placeholder "unc". If this is submitted as a password, the
 	// old password is kept
 	if isInitialSetup || pw != "unc" {
-		result.Authentication.SaltAdmin = helper.GenerateRandomString(30)
-		result.Authentication.Password = configuration.HashPasswordCustomSalt(pw, result.Authentication.SaltAdmin)
+		authInfo.PasswordInternalAuth = configuration.HashPassword(pw, false, "")
 	}
 	return nil
 }
 
-func parseOAuthSettings(result *models.Configuration, formObjects *[]jsonFormObject) error {
+func parseOAuthSettings(result *models.Configuration, authInfo *authSettings, formObjects *[]jsonFormObject) error {
 	var err error
 	result.Authentication.OAuthProvider, err = getFormValueString(formObjects, "oauth_provider")
 	if err != nil {
 		return err
-	}
-	if strings.HasSuffix(result.Authentication.OAuthProvider, "/") {
-		result.Authentication.OAuthProvider = strings.TrimRight(result.Authentication.OAuthProvider, "/")
 	}
 
 	result.Authentication.OAuthClientId, err = getFormValueString(formObjects, "oauth_id")
@@ -307,31 +430,20 @@ func parseOAuthSettings(result *models.Configuration, formObjects *[]jsonFormObj
 		return err
 	}
 
-	restrictUsers, err := getFormValueBool(formObjects, "oauth_restrict_users")
-	if err != nil {
-		return err
-	}
-
 	result.Authentication.OAuthRecheckInterval, err = getFormValueInt(formObjects, "oauth_recheck_interval")
 	if err != nil {
 		return err
 	}
 
-	scopeUsers, err := getFormValueString(formObjects, "oauth_scope_users")
+	username, err := getFormValueString(formObjects, "oauth_admin_user")
 	if err != nil {
 		return err
 	}
+	authInfo.UserOAuth = username
 
-	oauthAllowedUsers, err := getFormValueString(formObjects, "oauth_allowed_users")
+	authInfo.OnlyRegisteredUsersOAuth, err = getFormValueBool(formObjects, "oauth_only_registered_users")
 	if err != nil {
 		return err
-	}
-	if restrictUsers {
-		result.Authentication.OAuthUserScope = scopeUsers
-		result.Authentication.OAuthUsers = splitAndTrim(oauthAllowedUsers)
-	} else {
-		result.Authentication.OAuthUsers = []string{}
-		result.Authentication.OAuthUserScope = ""
 	}
 
 	restrictGroups, err := getFormValueBool(formObjects, "oauth_restrict_groups")
@@ -357,18 +469,21 @@ func parseOAuthSettings(result *models.Configuration, formObjects *[]jsonFormObj
 	return nil
 }
 
-func parseHeaderAuthSettings(result *models.Configuration, formObjects *[]jsonFormObject) error {
-	var err error
+func parseHeaderAuthSettings(result *models.Configuration, authInfo *authSettings, formObjects *[]jsonFormObject) error {
+	username, err := getFormValueString(formObjects, "auth_header_admin")
+	if err != nil {
+		return err
+	}
+	authInfo.UserHeader = username
 	result.Authentication.HeaderKey, err = getFormValueString(formObjects, "auth_headerkey")
 	if err != nil {
 		return err
 	}
 
-	headerAllowedUsers, err := getFormValueString(formObjects, "auth_header_users")
+	authInfo.OnlyRegisteredUsersHeader, err = getFormValueBool(formObjects, "auth_header_only_registered_users")
 	if err != nil {
 		return err
 	}
-	result.Authentication.HeaderUsers = splitAndTrim(headerAllowedUsers)
 	return nil
 }
 
@@ -412,6 +527,10 @@ func parseServerSettings(result *models.Configuration, formObjects *[]jsonFormOb
 	if err != nil {
 		return err
 	}
+	result.IncludeFilename, err = getFormValueBool(formObjects, "showfilename_sel")
+	if err != nil {
+		return err
+	}
 
 	result.Authentication.Method, err = getFormValueInt(formObjects, "authentication_sel")
 	if err != nil {
@@ -443,8 +562,12 @@ func parseCloudSettings(formObjects *[]jsonFormObject) (*cloudconfig.CloudConfig
 }
 
 func getCloudConfig(formObjects *[]jsonFormObject) (*cloudconfig.CloudConfig, error) {
-	var err error
 	awsConfig := cloudconfig.CloudConfig{}
+	proxyDownload, err := getFormValueString(formObjects, "storage_sel_proxy")
+	if err != nil {
+		return nil, err
+	}
+	awsConfig.Aws.ProxyDownload = proxyDownload == "proxy"
 	awsConfig.Aws.Bucket, err = getFormValueString(formObjects, "s3_bucket")
 	if err != nil {
 		return nil, err
@@ -486,10 +609,11 @@ func encryptionHasChanged(encLevel int, formObjects *[]jsonFormObject) (bool, er
 	return false, nil
 }
 
-func parseEncryptionAndDelete(result *models.Configuration, formObjects *[]jsonFormObject) error {
+func parseEncryptionAndDelete(result *models.Configuration, formObjects *[]jsonFormObject) (configuration.End2EndReconfigParameters, error) {
+	var e2eConfig configuration.End2EndReconfigParameters
 	encLevel, err := parseEncryptionLevel(formObjects)
 	if err != nil {
-		return err
+		return e2eConfig, err
 	}
 
 	generateNewEncConfig := true
@@ -497,48 +621,48 @@ func parseEncryptionAndDelete(result *models.Configuration, formObjects *[]jsonF
 	if !isInitialSetup {
 		generateNewEncConfig, err = encryptionHasChanged(encLevel, formObjects)
 		if err != nil {
-			return err
+			return configuration.End2EndReconfigParameters{}, err
 		}
 		if encLevel == encryption.EndToEndEncryption {
 			deleteE2eInfo, _ := getFormValueString(formObjects, "cleare2e")
 			if deleteE2eInfo == "true" {
-				database.DeleteEnd2EndInfo()
+				e2eConfig.DeleteEnd2EndEncryption = true
 			}
 		}
 	}
 
 	if !generateNewEncConfig {
 		result.Encryption = configuration.Get().Encryption
-		return nil
+		return e2eConfig, nil
 	}
 	if !isInitialSetup {
-		storage.DeleteAllEncrypted()
+		e2eConfig.DeleteEncryptedStorage = true
 	}
 
 	result.Encryption = models.Encryption{}
 	if encLevel == encryption.LocalEncryptionStored || encLevel == encryption.FullEncryptionStored {
 		cipher, err := encryption.GetRandomCipher()
 		if err != nil {
-			return err
+			return configuration.End2EndReconfigParameters{}, err
 		}
 		result.Encryption.Cipher = cipher
 	}
 
 	masterPw, err := getFormValueString(formObjects, "enc_pw")
 	if err != nil {
-		return err
+		return configuration.End2EndReconfigParameters{}, err
 	}
 	if encLevel == encryption.LocalEncryptionInput || encLevel == encryption.FullEncryptionInput {
 		result.Encryption.Salt = helper.GenerateRandomString(30)
 		result.Encryption.ChecksumSalt = helper.GenerateRandomString(30)
-		const minLength = 8
+		minLength := environment.New().MinLengthPassword
 		if len(masterPw) < minLength {
-			return errors.New("password is less than " + strconv.Itoa(minLength) + " characters long")
+			return configuration.End2EndReconfigParameters{}, errors.New("password is less than " + strconv.Itoa(minLength) + " characters long")
 		}
 		result.Encryption.Checksum = encryption.PasswordChecksum(masterPw, result.Encryption.ChecksumSalt)
 	}
 	result.Encryption.Level = encLevel
-	return nil
+	return e2eConfig, nil
 }
 
 func parseEncryptionLevel(formObjects *[]jsonFormObject) (int, error) {
@@ -579,26 +703,37 @@ func splitAndTrim(input string) []string {
 }
 
 type setupView struct {
-	IsInitialSetup bool
-	LocalhostOnly  bool
-	HasAwsFeature  bool
-	IsDocker       bool
-	Port           int
-	OAuthUsers     string
-	OAuthGroups    string
-	HeaderUsers    string
-	Auth           models.AuthenticationConfig
-	Settings       models.Configuration
-	CloudSettings  cloudconfig.CloudConfig
-	ProtectedUrls  []string
+	IsInitialSetup     bool
+	LocalhostOnly      bool
+	HasAwsFeature      bool
+	IsDocker           bool
+	S3EnvProvided      bool
+	IsDataNotMounted   bool
+	IsConfigNotMounted bool
+	Port               int
+	OAuthGroups        string
+	Auth               models.AuthenticationConfig
+	Settings           models.Configuration
+	CloudSettings      cloudconfig.CloudConfig
+	DatabaseSettings   models.DbConnection
+	ProtectedUrls      []string
+	MinPasswordLength  int
 }
 
 func (v *setupView) loadFromConfig() {
 	v.IsInitialSetup = isInitialSetup
-	v.IsDocker = environment.IsDockerInstance()
+	env := environment.New()
+	if environment.IsDockerInstance() {
+		v.IsDocker = true
+		v.IsDataNotMounted = !isVolumeMounted(env.DataDir)
+		v.IsConfigNotMounted = !isVolumeMounted(env.ConfigDir)
+	}
 	v.HasAwsFeature = aws.IsIncludedInBuild
 	v.ProtectedUrls = protectedUrls
 	if isInitialSetup {
+		v.MinPasswordLength = env.MinLengthPassword
+		v.CloudSettings, _ = cloudconfig.Load()
+		v.S3EnvProvided = env.IsAwsProvided()
 		return
 	}
 	configuration.Load()
@@ -606,9 +741,7 @@ func (v *setupView) loadFromConfig() {
 	v.Settings = *settings
 	v.Auth = settings.Authentication
 	v.CloudSettings, _ = cloudconfig.Load()
-	v.OAuthUsers = strings.Join(settings.Authentication.OAuthUsers, ";")
 	v.OAuthGroups = strings.Join(settings.Authentication.OAuthGroups, ";")
-	v.HeaderUsers = strings.Join(settings.Authentication.HeaderUsers, ";")
 
 	if strings.Contains(settings.Port, "localhost") || strings.Contains(settings.Port, "127.0.0.1") {
 		v.LocalhostOnly = true
@@ -620,6 +753,41 @@ func (v *setupView) loadFromConfig() {
 	} else {
 		v.Port = environment.DefaultPort
 	}
+	v.S3EnvProvided = env.IsAwsProvided()
+	v.MinPasswordLength = env.MinLengthPassword
+
+	dbSettings, err := database.ParseUrl(settings.DatabaseUrl, false)
+	helper.Check(err)
+	v.DatabaseSettings = dbSettings
+}
+
+func isVolumeMounted(dir string) bool {
+	file, err := os.Open("/proc/mounts")
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+	defer file.Close()
+	return isPathMounted(file, dir)
+}
+
+func isPathMounted(mounts io.Reader, dir string) bool {
+	if !path.IsAbs(dir) {
+		dir = path.Join("/app", dir)
+	}
+	dir = path.Clean(dir)
+	scanner := bufio.NewScanner(mounts)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		mountPath := path.Clean(fields[1])
+		if mountPath != "/" && (dir == mountPath || strings.HasPrefix(dir, mountPath+"/")) {
+			return true
+		}
+	}
+	return false
 }
 
 // Handling of /start
@@ -633,7 +801,7 @@ func handleShowSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleShowMaintenance(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("Server is in maintenance mode, please try again in a few minutes."))
+	_, _ = w.Write([]byte("Server is in maintenance mode, please try again in a few minutes."))
 }
 
 // Handling of /setupResult
@@ -644,23 +812,26 @@ func handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newConfig, cloudSettings, err := toConfiguration(&setupResult)
+	newConfig, cloudSettings, e2eConfig, authInfo, err := toConfiguration(&setupResult)
 	if err != nil {
 		outputError(w, err)
 		return
 	}
-	configuration.LoadFromSetup(newConfig, cloudSettings, isInitialSetup)
+	configuration.LoadFromSetup(newConfig, cloudSettings, e2eConfig, authInfo.PasswordInternalAuth)
 	w.WriteHeader(200)
-	w.Write([]byte("{ \"result\": \"OK\"}"))
+	_, _ = w.Write([]byte("{ \"result\": \"OK\"}"))
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		srv.Shutdown(context.Background())
+		err = srv.Shutdown(context.Background())
+		if err != nil {
+			fmt.Println(err)
+		}
 	}()
 }
 
 func outputError(w http.ResponseWriter, err error) {
 	w.WriteHeader(500)
-	w.Write([]byte("{ \"result\": \"Error\", \"error\": \"" + err.Error() + "\"}"))
+	_, _ = w.Write([]byte("{ \"result\": \"Error\", \"error\": \"" + err.Error() + "\"}"))
 }
 
 // Adds a / character to the end of a URL if it does not exist
@@ -679,51 +850,148 @@ func verifyPortNumber(port int) int {
 }
 
 type testAwsRequest struct {
-	Bucket     string `json:"bucket"`
-	Region     string `json:"region"`
-	ApiKey     string `json:"apikey"`
-	ApiSecret  string `json:"apisecret"`
-	Endpoint   string `json:"endpoint"`
-	GokapiUrl  string `json:"exturl"`
-	Expiration int    `json:"expiration"`
+	Bucket         string `json:"bucket"`
+	Region         string `json:"region"`
+	ApiKey         string `json:"apikey"`
+	ApiSecret      string `json:"apisecret"`
+	Endpoint       string `json:"endpoint"`
+	GokapiUrl      string `json:"exturl"`
+	SetupPassword  string `json:"setupPassword"`
+	EnvProvided    bool   `json:"isEnvProvided"`
+	Expiration     int    `json:"expiration"`
+}
+
+type awsTestResponse struct {
+	Code   int    `json:"code"`
+	Result string `json:"result"`
 }
 
 // Handling of /testaws
 func handleTestAws(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	decoder := json.NewDecoder(r.Body)
 	var t testAwsRequest
 	err := decoder.Decode(&t)
 	if err != nil {
-		w.Write([]byte("Error: " + err.Error()))
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(awsTestResponse{
+			Code:   http.StatusBadRequest,
+			Result: "Invalid JSON provided",
+		})
 		return
 	}
-	awsconfig := models.AwsConfig{
-		Bucket:    t.Bucket,
-		Region:    t.Region,
-		KeyId:     t.ApiKey,
-		KeySecret: t.ApiSecret,
-		Endpoint:  t.Endpoint,
-		Expiration: t.Expiration,
+	if isInitialSetup {
+		ratelimiter.WaitOnSetupLogin()
+		if t.SetupPassword == "" || subtle.ConstantTimeCompare([]byte(t.SetupPassword), []byte(credentialAWSTest)) != 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(awsTestResponse{
+				Code:   http.StatusUnauthorized,
+				Result: "Invalid AWS test password provided",
+			})
+			return
+		}
 	}
-	ok, err := aws.IsValidLogin(awsconfig)
+	var awsConfig models.AwsConfig
+
+	if !t.EnvProvided {
+		awsConfig = models.AwsConfig{
+			Bucket:     t.Bucket,
+			Region:     t.Region,
+			KeyId:      t.ApiKey,
+			KeySecret:  t.ApiSecret,
+			Endpoint:   t.Endpoint,
+			Expiration: t.Expiration,
+		}
+	} else {
+		env := environment.New()
+		awsConfig = models.AwsConfig{
+			Bucket:    env.AwsBucket,
+			Region:    env.AwsRegion,
+			KeyId:     env.AwsKeyId,
+			KeySecret: env.AwsKeySecret,
+			Endpoint:  env.AwsEndpoint,
+			Expiration: env.AwsExpiration,
+		}
+	}
+	ok, err := aws.IsValidLogin(awsConfig)
 	if err != nil {
-		w.Write([]byte("Error: " + err.Error()))
+		handleAwsError(w, err, awsOperationLogin)
 		return
 	}
 	if !ok {
-		w.Write([]byte("Error: Invalid or incomplete credentials provided"))
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(awsTestResponse{
+			Code:   http.StatusBadRequest,
+			Result: "Invalid or incomplete credentials provided",
+		})
 		return
 	}
-	aws.Init(awsconfig)
-	ok, err = aws.IsCorsCorrectlySet(t.Bucket, t.GokapiUrl)
+	aws.Init(awsConfig)
+	ok, err = aws.IsCorsCorrectlySet(awsConfig.Bucket, t.GokapiUrl)
 	aws.LogOut()
 	if err != nil {
-		w.Write([]byte("Could not check CORS settings. Error: " + err.Error()))
+		handleAwsError(w, err, awsOperationCors)
 		return
 	}
 	if !ok {
-		w.Write([]byte("Test OK, however CORS settings do not allow encrypted downloads."))
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(awsTestResponse{
+			Code:   http.StatusOK,
+			Result: "Test OK. WARNING: CORS settings do not allow encrypted downloads.",
+		})
 		return
 	}
-	w.Write([]byte("Test OK, CORS settings allow encrypted downloads."))
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(awsTestResponse{
+		Code:   http.StatusOK,
+		Result: "All tests OK.",
+	})
+}
+
+const (
+	awsOperationLogin = iota
+	awsOperationCors
+)
+
+func handleAwsError(w http.ResponseWriter, err error, operation int) {
+	var awsErr awserr.Error
+	isAwsErr := errors.As(err, &awsErr)
+	var prefix string
+	switch operation {
+	case awsOperationLogin:
+		prefix = "Unable to login. "
+	case awsOperationCors:
+		prefix = "Could not get CORS settings. "
+	}
+	var response awsTestResponse
+
+	if isAwsErr {
+		response.Code = http.StatusBadRequest
+		code := awsErr.Code()
+		switch code {
+		case s3.ErrCodeNoSuchBucket:
+			response.Result = "Invalid bucket or regions provided, bucket does not exist."
+		case "Forbidden":
+			response.Result = "Invalid credentials provided, check bucket and region."
+		case "RequestError":
+			response.Result = "Unable to connect to server, check endpoint."
+		case "SerializationError":
+			response.Result = "Invalid response received by server, check endpoint."
+		case "NotFound":
+			if operation == awsOperationCors {
+				response.Code = http.StatusOK
+				response.Result = "Login OK, but could not check bucket CORS settings."
+			} else {
+				response.Result = "The requested resource could not be found, check endpoint."
+			}
+		default:
+			response.Result = prefix + "Error " + awsErr.Code() + ": " + err.Error()
+		}
+	} else {
+		response.Code = http.StatusInternalServerError
+		response.Result = prefix + "Error: " + err.Error()
+	}
+
+	w.WriteHeader(response.Code)
+	_ = json.NewEncoder(w).Encode(response)
 }

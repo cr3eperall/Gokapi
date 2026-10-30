@@ -6,6 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -13,11 +19,9 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/forceu/gokapi/internal/encryption"
 	"github.com/forceu/gokapi/internal/models"
-	"io"
-	"net/http"
-	"strings"
-	"time"
+	"github.com/forceu/gokapi/internal/webserver/headers"
 )
 
 var awsConfig models.AwsConfig
@@ -104,11 +108,10 @@ func Upload(input io.Reader, file models.File) (string, error) {
 	return result.Location, nil
 }
 
-// Download downloads a file from AWS, used for encrypted files and testing
-func Download(writer io.WriterAt, file models.File) (int64, error) {
+// download downloads a file from AWS, used for testing
+func download(writer io.WriterAt, file models.File) (int64, error) {
 	sess := createSession()
 	downloader := s3manager.NewDownloader(sess)
-
 	size, err := downloader.Download(writer, &s3.GetObjectInput{
 		Bucket: aws.String(file.AwsBucket),
 		Key:    aws.String(file.SHA1),
@@ -119,16 +122,51 @@ func Download(writer io.WriterAt, file models.File) (int64, error) {
 	return size, nil
 }
 
-// RedirectToDownload creates a presigned link that is valid for 15 seconds and redirects the
-// client to this url
-func RedirectToDownload(w http.ResponseWriter, r *http.Request, file models.File, forceDownload bool) error {
+// Stream downloads a file from AWS sequentially, used for saving to a Zip file
+func Stream(writer io.Writer, file models.File) error {
 	sess := createSession()
 	s3svc := s3.New(sess)
 
-	contentDisposition := "inline; filename=\"" + file.Name + "\""
-	if forceDownload {
-		contentDisposition = "Attachment; filename=\"" + file.Name + "\""
+	obj, err := s3svc.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(file.AwsBucket),
+		Key:    aws.String(file.SHA1),
+	})
+	if err != nil {
+		return err
 	}
+	defer obj.Body.Close()
+
+	var reader io.Reader = obj.Body
+
+	if file.Encryption.IsEncrypted {
+		return encryption.DecryptReader(file.Encryption, obj.Body, writer)
+	}
+	_, err = io.Copy(writer, reader)
+	return err
+}
+
+// ServeFile either redirects the user to a pre-signed download url (default) or downloads the file and serves it as a proxy (depending
+// on configuration). Returns true if blocking operation (to set download status) or false if non-blocking.
+func ServeFile(w http.ResponseWriter, r *http.Request, file models.File, forceDownload, forceDecryption bool) (bool, error) {
+	if forceDecryption {
+		return true, serveDecryptedFile(w, file)
+	}
+	if awsConfig.ProxyDownload {
+		return true, proxyDownload(w, file, forceDownload)
+	}
+	return false, redirectToDownload(w, r, file, forceDownload)
+}
+
+func getPresignedUrl(file models.File, forceDownload bool) (string, error) {
+	sess := createSession()
+	s3svc := s3.New(sess)
+
+	dispositionType := "inline"
+	if forceDownload {
+		dispositionType = "Attachment"
+	}
+	// Use RFC 6266 format to support UTF-8 filenames and avoid encoding errors.
+	contentDisposition := fmt.Sprintf("%s; filename*=UTF-8''%s", dispositionType, url.PathEscape(file.Name))
 
 	req, _ := s3svc.GetObjectRequest(&s3.GetObjectInput{
 		Bucket:                     aws.String(file.AwsBucket),
@@ -138,13 +176,55 @@ func RedirectToDownload(w http.ResponseWriter, r *http.Request, file models.File
 		ResponseContentType:        aws.String(file.ContentType),
 	})
 
-	url, err := req.Presign(time.Duration(awsConfig.Expiration) * time.Second)
+	url, err := req.Presign(15 * time.Second)
 	if err != nil {
 		return err
 	}
 
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 	return nil
+}
+
+// proxyDownload streams the file from S3 as a proxy, by downloading a presigned url
+func proxyDownload(w http.ResponseWriter, file models.File, forceDownload bool) error {
+	url, err := getPresignedUrl(file, forceDownload)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	headers.Write(file, w, forceDownload, false)
+	_, _ = io.Copy(w, resp.Body)
+	return nil
+}
+
+func serveDecryptedFile(w http.ResponseWriter, file models.File) error {
+	sess := createSession()
+	s3svc := s3.New(sess)
+
+	// 1. Get the object from S3
+	obj, err := s3svc.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(file.AwsBucket),
+		Key:    aws.String(file.SHA1),
+	})
+	if err != nil {
+		return err
+	}
+	defer obj.Body.Close()
+
+	headers.Write(file, w, true, true)
+	if file.Encryption.IsEncrypted {
+		if !encryption.IsDecryptionAvailable() {
+			return errors.New("file is encrypted but server-side decryption key is not available")
+		}
+		return encryption.DecryptReader(file.Encryption, obj.Body, w)
+	}
+	_, err = io.Copy(w, obj.Body)
+	return err
 }
 
 func getTimeoutContext() (context.Context, context.CancelFunc) {
@@ -175,14 +255,15 @@ func fileExists(bucket, filename string) (bool, int64, error) {
 	})
 
 	if err != nil {
-		aerr, ok := err.(awserr.Error)
+		var aerr awserr.Error
+		ok := errors.As(err, &aerr)
 		if ok {
 			if aerr.Code() == "NotFound" {
 				return false, 0, nil
 			}
-		}
-		if aerr.Code() == request.CanceledErrorCode {
-			return false, 0, errors.New("Timeout - could not connect to " + *svc.Config.Endpoint)
+			if aerr.Code() == request.CanceledErrorCode {
+				return false, 0, errors.New("Timeout - could not connect to " + *svc.Config.Endpoint)
+			}
 		}
 		return false, 0, err
 	}
@@ -221,8 +302,10 @@ func IsCorsCorrectlySet(bucket, gokapiUrl string) (bool, error) {
 
 	result, err := svc.GetBucketCorsWithContext(ctx, input)
 	if err != nil {
-		aerr, ok := err.(awserr.Error)
-		if ok && aerr.Code() == "NoSuchCorsConfiguration" {
+		var aerr awserr.Error
+		ok := errors.As(err, &aerr)
+		if ok && (aerr.Code() == "NoSuchCORSConfiguration" ||
+			aerr.Code() == "NoSuchCorsConfiguration") {
 			return false, nil
 		}
 		return false, err

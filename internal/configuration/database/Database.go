@@ -1,156 +1,381 @@
 package database
 
 import (
-	"database/sql"
+	"errors"
 	"fmt"
-	"github.com/forceu/gokapi/internal/helper"
-	"log"
-	// Required for sqlite driver
-	_ "modernc.org/sqlite"
+	"net/url"
 	"os"
-	"path/filepath"
+	"strings"
+
+	"github.com/forceu/gokapi/internal/configuration/database/dbabstraction"
+	"github.com/forceu/gokapi/internal/configuration/database/dbcache"
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/models"
 )
 
-var sqliteDb *sql.DB
+var db dbabstraction.Database
 
-// Init creates the database files and connects to it
-func Init(dataDir, dbName string) {
-	if sqliteDb == nil {
-		dataDir = filepath.Clean(dataDir)
-		var err error
-		if !helper.FolderExists(dataDir) {
-			err = os.MkdirAll(dataDir, 0700)
-			helper.Check(err)
-		}
-		dbFullPath := dataDir + "/" + dbName
-		sqliteDb, err = sql.Open("sqlite", dbFullPath+"?_pragma=busy_timeout=10000&_pragma=journal_mode=WAL")
-		if err != nil {
-			log.Fatal(err)
-		}
-		sqliteDb.SetMaxOpenConns(10000)
-		sqliteDb.SetMaxIdleConns(10000)
+// Connect establishes a connection to the database and creates the table structure, if necessary
+func Connect(config models.DbConnection) {
+	var err error
+	dbcache.Init()
+	db, err = dbabstraction.GetNew(config)
+	if err != nil {
+		panic(err)
+	}
+}
 
-		if !helper.FileExists(dbFullPath) {
-			createNewDatabase()
+// ParseUrl converts a database URL to a models.DbConnection struct
+func ParseUrl(dbUrl string, mustExist bool) (models.DbConnection, error) {
+	if dbUrl == "" {
+		return models.DbConnection{}, errors.New("dbUrl is empty")
+	}
+	u, err := url.Parse(dbUrl)
+	if err != nil {
+		return models.DbConnection{}, fmt.Errorf("unsupported database URL - expected format is: type://username:password@server: %v", err)
+	}
+	result := models.DbConnection{}
+	switch strings.ToLower(u.Scheme) {
+	case "sqlite":
+		result.Type = dbabstraction.TypeSqlite
+		result.HostUrl = strings.TrimPrefix(dbUrl, "sqlite://")
+		if mustExist {
+			exist, errEx := helper.FileExists(result.HostUrl)
+			if errEx != nil {
+				return models.DbConnection{}, errEx
+			}
+			if !exist {
+				return models.DbConnection{}, fmt.Errorf("file %s does not exist\n", result.HostUrl)
+			}
 		}
+	case "redis":
+		result.Type = dbabstraction.TypeRedis
+		result.HostUrl = u.Host
+	default:
+		return models.DbConnection{}, fmt.Errorf("unsupported database type: %s\n", dbUrl)
+	}
+
+	query := u.Query()
+
+	result.Username = u.User.Username()
+	result.Password, _ = u.User.Password()
+	result.RedisUseSsl = query.Has("ssl")
+	result.RedisPrefix = query.Get("prefix")
+
+	return result, nil
+}
+
+// Migrate copies a database to a new location
+func Migrate(configOld, configNew models.DbConnection) {
+	dbOld, err := dbabstraction.GetNew(configOld)
+	helper.Check(err)
+	dbNew, err := dbabstraction.GetNew(configNew)
+	helper.Check(err)
+
+	apiKeys := dbOld.GetAllApiKeys()
+	for _, apiKey := range apiKeys {
+		dbNew.SaveApiKey(apiKey)
+	}
+	users := dbOld.GetAllUsers()
+	for _, user := range users {
+		dbNew.SaveUser(user, false)
+		dbNew.SaveEnd2EndInfo(dbOld.GetEnd2EndInfo(user.Id), user.Id)
+	}
+	files := dbOld.GetAllMetadata()
+	for _, file := range files {
+		dbNew.SaveMetaData(file)
+		if file.HotlinkId != "" {
+			dbNew.SaveHotlink(file)
+		}
+	}
+	requests := dbOld.GetAllFileRequests()
+	for _, request := range requests {
+		dbNew.SaveFileRequest(request)
+	}
+	dbOld.Close()
+	dbNew.Close()
+}
+
+// RunGarbageCollection runs the databases GC
+func RunGarbageCollection() {
+	db.RunGarbageCollection()
+}
+
+var osExit = os.Exit
+
+// Upgrade migrates the DB to a new Gokapi version, if required
+func Upgrade() {
+	dbVersion := db.GetDbVersion()
+	expectedVersion := db.GetSchemaVersion()
+	if dbVersion > expectedVersion {
+		fmt.Println("Error: Database is from a newer Gokapi version. Unable to continue.")
+		osExit(1)
+		return
+	}
+	if dbVersion < expectedVersion {
+		db.Upgrade(dbVersion)
+		db.SetDbVersion(expectedVersion)
+		fmt.Printf("Successfully upgraded database to version %d\n", expectedVersion)
 	}
 }
 
 // Close the database connection
 func Close() {
-	if sqliteDb != nil {
-		err := sqliteDb.Close()
-		if err != nil {
-			fmt.Println(err)
+	db.Close()
+}
+
+// Api Key Section
+
+// GetAllApiKeys returns a map with all API keys
+func GetAllApiKeys() map[string]models.ApiKey {
+	return db.GetAllApiKeys()
+}
+
+// GetApiKey returns a models.ApiKey if valid or false if the ID is not valid
+func GetApiKey(id string) (models.ApiKey, bool) {
+	return db.GetApiKey(id)
+}
+
+// GetApiKeyByPublicKey returns an API key by using the public key
+func GetApiKeyByPublicKey(publicKey string) (string, bool) {
+	return db.GetApiKeyByPublicKey(publicKey)
+}
+
+// SaveApiKey saves the API key to the database
+func SaveApiKey(apikey models.ApiKey) {
+	db.SaveApiKey(apikey)
+}
+
+// UpdateTimeApiKey writes the content of LastUsage to the database
+func UpdateTimeApiKey(apikey models.ApiKey) {
+	// To reduce database writes, the entry is only updated if the last timestamp is more than 30 seconds old
+	if dbcache.RequireSaveApiKeyUsage(apikey.Id) {
+		db.UpdateTimeApiKey(apikey)
+	}
+}
+
+// DeleteApiKey deletes an API key with the given ID
+func DeleteApiKey(id string) {
+	db.DeleteApiKey(id)
+}
+
+// E2E Section
+
+// SaveEnd2EndInfo stores the encrypted e2e info
+func SaveEnd2EndInfo(info models.E2EInfoEncrypted, userId int) {
+	info.AvailableFiles = nil
+	db.SaveEnd2EndInfo(info, userId)
+}
+
+// GetEnd2EndInfo retrieves the encrypted e2e info
+func GetEnd2EndInfo(userId int) models.E2EInfoEncrypted {
+	return db.GetEnd2EndInfo(userId)
+}
+
+// DeleteEnd2EndInfo resets the encrypted e2e info
+func DeleteEnd2EndInfo(userId int) {
+	db.DeleteEnd2EndInfo(userId)
+}
+
+// Hotlink Section
+
+// GetHotlink returns the id of the file associated or false if not found
+func GetHotlink(id string) (string, bool) {
+	return db.GetHotlink(id)
+}
+
+// GetAllHotlinks returns an array with all hotlink ids
+func GetAllHotlinks() []string {
+	return db.GetAllHotlinks()
+}
+
+// SaveHotlink stores the hotlink associated with the file in the database
+func SaveHotlink(file models.File) {
+	db.SaveHotlink(file)
+}
+
+// DeleteHotlink deletes a hotlink with the given hotlink ID
+func DeleteHotlink(id string) {
+	db.DeleteHotlink(id)
+}
+
+// Metadata Section
+
+// GetAllMetadata returns a map of all available files
+func GetAllMetadata() map[string]models.File {
+	return db.GetAllMetadata()
+}
+
+// GetMetaDataById returns a models.File from the ID passed or false if the id is not valid
+func GetMetaDataById(id string) (models.File, bool) {
+	return db.GetMetaDataById(id)
+}
+
+// SaveMetaData stores the metadata of a file to the disk
+func SaveMetaData(file models.File) {
+	db.SaveMetaData(file)
+}
+
+// DeleteMetaData deletes information about a file
+func DeleteMetaData(id string) {
+	db.DeleteMetaData(id)
+}
+
+// IncreaseDownloadCount increases the download count of a file atomically
+func IncreaseDownloadCount(id string, decreaseRemainingDownloads bool) {
+	db.IncreaseDownloadCount(id, decreaseRemainingDownloads)
+}
+
+// GetDownloadsRemaining returns the remaining downloads of a file that does not implement UnlimitedDownloads
+func GetDownloadsRemaining(id string) int {
+	return db.GetDownloadsRemaining(id)
+}
+
+// Session Section
+
+// GetSession returns the session with the given ID or false if not a valid ID
+func GetSession(id string) (models.Session, bool) {
+	return db.GetSession(id)
+}
+
+// SaveSession stores the given session. After the expiry passed, it will be deleted automatically
+func SaveSession(id string, session models.Session) {
+	db.SaveSession(id, session)
+}
+
+// DeleteSession deletes a session with the given ID
+func DeleteSession(id string) {
+	db.DeleteSession(id)
+}
+
+// DeleteAllSessions logs all users out
+func DeleteAllSessions() {
+	db.DeleteAllSessions()
+}
+
+// DeleteAllSessionsByUser logs the specific users out
+func DeleteAllSessionsByUser(userId int) {
+	db.DeleteAllSessionsByUser(userId)
+}
+
+// User Section
+
+// GetAllUsers returns a map with all users
+func GetAllUsers() []models.User {
+	return db.GetAllUsers()
+}
+
+// GetUser returns a models.User if valid or false if the ID is not valid
+func GetUser(id int) (models.User, bool) {
+	return db.GetUser(id)
+}
+
+// GetUserByName returns a models.User if valid or false if the email is not valid
+func GetUserByName(username string) (models.User, bool) {
+	username = strings.ToLower(username)
+	return db.GetUserByName(username)
+}
+
+// SaveUser saves a user to the database. If isNewUser is true, a new Id will be generated
+func SaveUser(user models.User, isNewUser bool) {
+	if user.Name == "" {
+		panic("username cannot be empty")
+	}
+	user.Name = strings.ToLower(user.Name)
+	db.SaveUser(user, isNewUser)
+}
+
+// UpdateUserLastOnline writes the last online time to the database
+func UpdateUserLastOnline(id int) {
+	// To reduce database writes, the entry is only updated if the last timestamp is more than 30 seconds old
+	if dbcache.RequireSaveUserOnline(id) {
+		db.UpdateUserLastOnline(id)
+	}
+}
+
+// DeleteUser deletes a user with the given ID
+func DeleteUser(id int) {
+	db.DeleteUser(id)
+}
+
+// GetSuperAdmin returns the models.User data for the super admin
+func GetSuperAdmin() (models.User, bool) {
+	users := db.GetAllUsers()
+	for _, user := range users {
+		if user.IsSuperAdmin() {
+			return user, true
 		}
 	}
-	sqliteDb = nil
+	return models.User{}, false
 }
 
-// RunGarbageCollection runs the databases GC
-func RunGarbageCollection() {
-	cleanExpiredSessions()
-	cleanUploadStatus()
-}
-
-// RawSqlite runs a raw SQL statement. Should only be used for upgrading
-func RawSqlite(statement string) error {
-	_, err := sqliteDb.Exec(statement)
-	return err
-}
-
-type schemaPragma struct {
-	Cid        string
-	Name       string
-	Type       string
-	NotNull    int
-	DefaultVal sql.NullString
-	Pk         int
-}
-
-// ColumnExists returns true if a column with the name columnName exists in table tableName
-// Should only be used for upgrading
-func ColumnExists(tableName, columnName string) (bool, error) {
-	rows, err := sqliteDb.Query("PRAGMA table_info(" + tableName + ")")
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var pragmaInfo schemaPragma
-		err = rows.Scan(&pragmaInfo.Cid, &pragmaInfo.Name, &pragmaInfo.Type, &pragmaInfo.NotNull, &pragmaInfo.DefaultVal, &pragmaInfo.Pk)
-		if err != nil {
-			return false, err
+// EditSuperAdmin changes parameters of the super admin. If no user exists, a new superadmin will be created
+// Returns an error if at least one user exists, but no superadmin
+func EditSuperAdmin(username, passwordHash string) error {
+	user, ok := GetSuperAdmin()
+	if !ok {
+		if len(GetAllUsers()) != 0 {
+			return errors.New("at least one user exists, but no superadmin found")
 		}
-		if pragmaInfo.Name == columnName {
-			return true, nil
+		newAdmin := models.User{
+			Name:        username,
+			Permissions: models.UserPermissionAll,
+			UserLevel:   models.UserLevelSuperAdmin,
+			Password:    passwordHash,
 		}
+		db.SaveUser(newAdmin, true)
+		return nil
 	}
-	return false, nil
+	if username != "" {
+		user.Name = username
+	}
+	if passwordHash != "" {
+		user.Password = passwordHash
+	}
+	db.SaveUser(user, false)
+	return nil
 }
 
-func createNewDatabase() {
-	sqlStmt := `
-		CREATE TABLE "ApiKeys" (
-			"Id"	TEXT NOT NULL UNIQUE,
-			"FriendlyName"	TEXT NOT NULL,
-			"LastUsed"	INTEGER NOT NULL,
-			"LastUsedString"	TEXT NOT NULL,
-			"Permissions"	INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY("Id")
-		) WITHOUT ROWID;
-		CREATE TABLE "E2EConfig" (
-			"id"	INTEGER NOT NULL UNIQUE,
-			"Config"	BLOB NOT NULL,
-			PRIMARY KEY("id" AUTOINCREMENT)
-		);
-		CREATE TABLE "FileMetaData" (
-			"Id"	TEXT NOT NULL UNIQUE,
-			"Name"	TEXT NOT NULL,
-			"Size"	TEXT NOT NULL,
-			"SHA1"	TEXT NOT NULL,
-			"ExpireAt"	INTEGER NOT NULL,
-			"SizeBytes"	INTEGER NOT NULL,
-			"ExpireAtString"	TEXT NOT NULL,
-			"DownloadsRemaining"	INTEGER NOT NULL,
-			"DownloadCount"	INTEGER NOT NULL,
-			"PasswordHash"	TEXT NOT NULL,
-			"HotlinkId"	TEXT NOT NULL,
-			"ContentType"	TEXT NOT NULL,
-			"AwsBucket"	TEXT NOT NULL,
-			"Encryption"	BLOB NOT NULL,
-			"UnlimitedDownloads"	INTEGER NOT NULL,
-			"UnlimitedTime"	INTEGER NOT NULL,
-			PRIMARY KEY("Id")
-		);
-		CREATE TABLE "Hotlinks" (
-			"Id"	TEXT NOT NULL UNIQUE,
-			"FileId"	TEXT NOT NULL UNIQUE,
-			PRIMARY KEY("Id")
-		) WITHOUT ROWID;
-		CREATE TABLE "Sessions" (
-			"Id"	TEXT NOT NULL UNIQUE,
-			"RenewAt"	INTEGER NOT NULL,
-			"ValidUntil"	INTEGER NOT NULL,
-			PRIMARY KEY("Id")
-		) WITHOUT ROWID;
-		CREATE TABLE "UploadConfig" (
-			"id"	INTEGER NOT NULL UNIQUE,
-			"Downloads"	INTEGER,
-			"TimeExpiry"	INTEGER,
-			"Password"	TEXT,
-			"UnlimitedDownloads"	INTEGER,
-			"UnlimitedTime"	INTEGER,
-			PRIMARY KEY("id")
-		);
-		CREATE TABLE "UploadStatus" (
-			"ChunkId"	TEXT NOT NULL UNIQUE,
-			"CurrentStatus"	INTEGER NOT NULL,
-			"LastUpdate"	INTEGER NOT NULL,
-			"CreationDate"	INTEGER NOT NULL,
-			PRIMARY KEY("ChunkId")
-		) WITHOUT ROWID;
-`
-	err := RawSqlite(sqlStmt)
-	helper.Check(err)
+// File Requests
+
+// GetFileRequest returns the FileRequest or false if not found
+func GetFileRequest(id string) (models.FileRequest, bool) {
+	return db.GetFileRequest(id)
+}
+
+// GetAllFileRequests returns an array with all file requests, ordered by creation date
+func GetAllFileRequests() []models.FileRequest {
+	return db.GetAllFileRequests()
+}
+
+// SaveFileRequest stores the file request associated with the file in the database
+func SaveFileRequest(request models.FileRequest) {
+	db.SaveFileRequest(request)
+}
+
+// DeleteFileRequest deletes a file request with the given ID
+func DeleteFileRequest(request models.FileRequest) {
+	db.DeleteFileRequest(request)
+}
+
+// Statistics
+
+// GetStatTraffic returns the total traffic from statistics
+func GetStatTraffic() uint64 {
+	return db.GetStatTraffic()
+}
+
+// SaveStatTraffic stores the total traffic
+func SaveStatTraffic(totalTraffic uint64) {
+	db.SaveStatTraffic(totalTraffic)
+}
+
+// SaveTrafficSince stores the beginning of traffic counting
+func SaveTrafficSince(since int64) {
+	db.SaveTrafficSince(since)
+}
+
+// GetTrafficSince gets the beginning of traffic counting
+func GetTrafficSince() (int64, bool) {
+	return db.GetTrafficSince()
 }

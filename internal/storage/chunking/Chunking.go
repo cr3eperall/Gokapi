@@ -2,8 +2,6 @@ package chunking
 
 import (
 	"errors"
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/helper"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -12,6 +10,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/environment"
+	"github.com/forceu/gokapi/internal/helper"
 )
 
 // ChunkInfo contains info about the current chunk
@@ -36,6 +38,7 @@ func ParseChunkInfo(r *http.Request, isApiCall bool) (ChunkInfo, error) {
 		return ChunkInfo{}, err
 	}
 
+	// If these are changed, make sure to edit End2End.go as well
 	formTotalSize := "dztotalfilesize"
 	formOffset := "dzchunkbyteoffset"
 	formUuid := "dzuuid"
@@ -46,7 +49,7 @@ func ParseChunkInfo(r *http.Request, isApiCall bool) (ChunkInfo, error) {
 		formUuid = "uuid"
 	}
 
-	buf := r.Form.Get(formTotalSize)
+	buf := r.PostForm.Get(formTotalSize)
 	info.TotalFilesizeBytes, err = strconv.ParseInt(buf, 10, 64)
 	if err != nil {
 		return ChunkInfo{}, err
@@ -55,7 +58,7 @@ func ParseChunkInfo(r *http.Request, isApiCall bool) (ChunkInfo, error) {
 		return ChunkInfo{}, errors.New("value cannot be negative")
 	}
 
-	buf = r.Form.Get(formOffset)
+	buf = r.PostForm.Get(formOffset)
 	info.Offset, err = strconv.ParseInt(buf, 10, 64)
 	if err != nil {
 		return ChunkInfo{}, err
@@ -64,18 +67,18 @@ func ParseChunkInfo(r *http.Request, isApiCall bool) (ChunkInfo, error) {
 		return ChunkInfo{}, errors.New("value cannot be negative")
 	}
 
-	info.UUID = r.Form.Get(formUuid)
+	info.UUID = r.PostForm.Get(formUuid)
 	if len(info.UUID) < 10 {
 		return ChunkInfo{}, errors.New("invalid uuid submitted, needs to be at least 10 characters long")
 	}
-	info.UUID = sanitseUuid(info.UUID)
+	info.UUID = sanitiseUuid(info.UUID)
 	return info, nil
 }
 
-func sanitseUuid(input string) string {
-	reg, err := regexp.Compile("[^a-zA-Z0-9-]")
-	helper.Check(err)
-	return reg.ReplaceAllString(input, "_")
+var regexUuidInput = regexp.MustCompile("[^a-zA-Z0-9-]")
+
+func sanitiseUuid(input string) string {
+	return regexUuidInput.ReplaceAllString(input, "_")
 }
 
 // ParseFileHeader parses the formdata and returns a FileHeader
@@ -84,12 +87,12 @@ func ParseFileHeader(r *http.Request) (FileHeader, error) {
 	if err != nil {
 		return FileHeader{}, err
 	}
-	name := r.Form.Get("filename")
+	name := helper.SanitiseFilename(r.PostForm.Get("filename"))
 	if name == "" {
-		return FileHeader{}, errors.New("empty filename provided")
+		return FileHeader{}, errors.New("empty or invalid filename provided")
 	}
-	contentType := parseContentType(r)
-	size := r.Form.Get("filesize")
+	contentType := parseContentType(r, name)
+	size := r.PostForm.Get("filesize")
 	if size == "" {
 		return FileHeader{}, errors.New("empty size provided")
 	}
@@ -107,16 +110,16 @@ func ParseFileHeader(r *http.Request) (FileHeader, error) {
 	}, nil
 }
 
-func parseContentType(r *http.Request) string {
-	contentType := r.Form.Get("filecontenttype")
+// parseContentType determines the MIME type from the form field or, as a
+// fallback, from the extension of the already-sanitised filename.
+func parseContentType(r *http.Request, sanitisedName string) string {
+	contentType := r.PostForm.Get("filecontenttype")
 	if contentType != "" {
-		return contentType
+		return helper.SanitiseContentType(contentType)
 	}
-	fileExt := strings.ToLower(filepath.Ext(r.Form.Get("filename")))
+	fileExt := strings.ToLower(filepath.Ext(sanitisedName))
 	switch fileExt {
-	case ".jpeg":
-		fallthrough
-	case ".jpg":
+	case ".jpg", ".jpeg":
 		contentType = "image/jpeg"
 	case ".png":
 		contentType = "image/png"
@@ -128,9 +131,7 @@ func parseContentType(r *http.Request) string {
 		contentType = "image/bmp"
 	case ".svg":
 		contentType = "image/svg+xml"
-	case ".tiff":
-		fallthrough
-	case ".tif":
+	case ".tif", ".tiff":
 		contentType = "image/tiff"
 	case ".ico":
 		contentType = "image/vnd.microsoft.icon"
@@ -149,18 +150,37 @@ func ParseMultipartHeader(header *multipart.FileHeader) (FileHeader, error) {
 		return FileHeader{}, errors.New("empty content-type provided")
 	}
 	return FileHeader{
-		Filename:    header.Filename,
+		Filename:    helper.SanitiseFilename(header.Filename),
 		Size:        header.Size,
-		ContentType: header.Header.Get("Content-Type"),
+		ContentType: helper.SanitiseContentType(header.Header.Get("Content-Type")),
 	}, nil
 }
 
 func getChunkFilePath(id string) string {
-	return configuration.Get().DataDir + "/chunk-" + id
+	return configuration.Get().DataDir + "/chunk-" + sanitiseUuid(id)
+}
+
+func isEnoughSpace(filesize int64) (bool, error) {
+	freeSpace, err := helper.GetFreeSpace(configuration.Get().DataDir)
+	if err != nil {
+		return false, err
+	}
+	env := environment.New()
+	minAdditionalSpace := int64(env.MinFreeSpaceMB) * 1024 * 1024
+	if freeSpace < uint64(filesize+minAdditionalSpace) {
+		return false, nil
+	}
+	return true, nil
 }
 
 // GetFileByChunkId returns a handle to the chunk file
 func GetFileByChunkId(id string) (*os.File, error) {
+	if id == "" {
+		return nil, errors.New("empty chunk id provided")
+	}
+	if !FileExists(id) {
+		return nil, errors.New("chunk file does not exist")
+	}
 	file, err := os.OpenFile(getChunkFilePath(id), os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
@@ -168,29 +188,53 @@ func GetFileByChunkId(id string) (*os.File, error) {
 	return file, nil
 }
 
+// DeleteChunk deletes the chunk file
+func DeleteChunk(id string) error {
+	if id == "" {
+		return errors.New("empty chunk id provided")
+	}
+	return os.Remove(getChunkFilePath(id))
+}
+
 // FileExists returns true if a file exists for the given chunk ID
 func FileExists(id string) bool {
-	return helper.FileExists(getChunkFilePath(id))
+	exists, err := helper.FileExists(getChunkFilePath(id))
+	helper.Check(err)
+	return exists
 }
 
 // NewChunk allocates the space for the new file and writes the chunk
-func NewChunk(chunkContent io.Reader, fileHeader *multipart.FileHeader, info ChunkInfo) error {
-	err := allocateFile(info)
+func NewChunk(chunkContent io.Reader, fileHeader *multipart.FileHeader, info ChunkInfo, maxAllowedSize int64) error {
+	err := allocateFile(info, maxAllowedSize)
 	if err != nil {
 		return err
 	}
 	return writeChunk(chunkContent, fileHeader, info)
 }
 
-func allocateFile(info ChunkInfo) error {
+func allocateFile(info ChunkInfo, maxAllowedSize int64) error {
+	if maxAllowedSize <= 0 {
+		return errors.New("invalid maxAllowedSize")
+	}
 	if FileExists(info.UUID) {
 		return nil
 	}
-	file, err := os.OpenFile(getChunkFilePath(info.UUID), os.O_RDWR|os.O_CREATE, 0600)
-	defer file.Close()
+	maxSizeBytes := min(int64(configuration.Get().MaxFileSizeMB)*1024*1024, maxAllowedSize)
+	if info.TotalFilesizeBytes > maxSizeBytes {
+		return errors.New("declared file size exceeds the maximum allowed size")
+	}
+	enoughSpace, err := isEnoughSpace(info.TotalFilesizeBytes)
 	if err != nil {
 		return err
 	}
+	if !enoughSpace {
+		return errors.New("not enough space on server for storing this file - please contact the administrator")
+	}
+	file, err := os.OpenFile(getChunkFilePath(info.UUID), os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
 	err = file.Truncate(info.TotalFilesizeBytes)
 	return err
 }
@@ -200,10 +244,10 @@ func writeChunk(chunkContent io.Reader, fileHeader *multipart.FileHeader, info C
 		return errors.New("chunksize will be bigger than total filesize from this offset")
 	}
 	file, err := GetFileByChunkId(info.UUID)
-	defer file.Close()
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 	newOffset, err := file.Seek(info.Offset, io.SeekStart)
 	if err != nil {
 		return err

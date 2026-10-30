@@ -16,6 +16,10 @@ func ParseFlags() MainFlags {
 	if DisableParsing {
 		return MainFlags{}
 	}
+	flags, ok := parseMigration()
+	if ok {
+		return flags
+	}
 
 	passedFlags := flag.FlagSet{}
 	versionFlagLong := passedFlags.Bool("version", false, "Show version info")
@@ -53,6 +57,10 @@ func ParseFlags() MainFlags {
 	})
 	disableCorsCheck := passedFlags.Bool("disable-cors-check", false, "Disables the CORS check on startup")
 
+	installService := passedFlags.Bool("install-service", false, "Installs Gokapi as a systemd service")
+	uninstallService := passedFlags.Bool("uninstall-service", false, "Uninstalls the Gokapi systemd service")
+	deploymentPassword := passedFlags.String("deployment-password", "", "Sets a new password. This should only be used for non-interactive deployment")
+
 	passedFlags.Usage = showUsage(passedFlags, aliases)
 	err := passedFlags.Parse(os.Args[1:])
 
@@ -64,23 +72,78 @@ func ParseFlags() MainFlags {
 	}
 
 	result := MainFlags{
-		ShowVersion:      *versionFlagShort || *versionFlagLong,
-		Reconfigure:      *reconfigureFlag,
-		CreateSsl:        *createSslFlag,
-		ConfigPath:       getAliasedString(configPathFlagLong, configPathFlagShort),
-		ConfigDir:        getAliasedString(configDirFlagLong, configDirFlagShort),
-		DataDir:          getAliasedString(dataDirFlagLong, dataDirFlagShort),
-		Port:             getAliasedInt(portFlagLong, portFlagShort),
-		DisableCorsCheck: *disableCorsCheck,
+		ShowVersion:        *versionFlagShort || *versionFlagLong,
+		Reconfigure:        *reconfigureFlag,
+		CreateSsl:          *createSslFlag,
+		ConfigPath:         getAliasedString(configPathFlagLong, configPathFlagShort),
+		ConfigDir:          getAliasedString(configDirFlagLong, configDirFlagShort),
+		DataDir:            getAliasedString(dataDirFlagLong, dataDirFlagShort),
+		Port:               getAliasedInt(portFlagLong, portFlagShort),
+		DisableCorsCheck:   *disableCorsCheck,
+		InstallService:     *installService,
+		UninstallService:   *uninstallService,
+		DeploymentPassword: *deploymentPassword,
 	}
 	result.setBoolValues()
 	return result
 }
 
-func showUsage(flags flag.FlagSet, aliases []alias) func() {
+func parseMigration() (MainFlags, bool) {
+	if len(os.Args) > 1 && os.Args[1] == "migrate-database" {
+		migrateFlags := parseMigrateFlags(os.Args[2:])
+		return MainFlags{
+			Migration: migrateFlags}, true
+	}
+	return MainFlags{}, false
+}
+
+func parseMigrateFlags(args []string) MigrateFlags {
+	migrateFlags := flag.NewFlagSet("migrate-database", flag.ExitOnError)
+	source := migrateFlags.String("source", "", "Source database connection string")
+	destination := migrateFlags.String("destination", "", "Destination database connection string")
+
+	migrateFlags.Usage = func() {
+		fmt.Println("Usage of migrate-database:")
+		migrateFlags.PrintDefaults()
+	}
+
+	err := migrateFlags.Parse(args)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(2)
+	}
+
+	if *source == "" {
+		fmt.Println("No source path for migration was passed")
+		os.Exit(1)
+	}
+	if *destination == "" {
+		fmt.Println("No destination path for migration was passed")
+		os.Exit(1)
+	}
+	if *source == *destination {
+		fmt.Println("Source and destination path cannot be the same")
+		os.Exit(1)
+	}
+
+	return MigrateFlags{
+		DoMigration: true,
+		Source:      *source,
+		Destination: *destination,
+	}
+}
+
+// MigrateFlags contains flags passed if migration is requested
+type MigrateFlags struct {
+	DoMigration bool
+	Source      string
+	Destination string
+}
+
+func showUsage(mainFlags flag.FlagSet, aliases []alias) func() {
 	return func() {
 		fmt.Print("Usage:\n\n")
-		flags.VisitAll(func(f *flag.Flag) {
+		mainFlags.VisitAll(func(f *flag.Flag) {
 			if isAlias(f.Name, aliases) {
 				return
 			}
@@ -97,6 +160,10 @@ func showUsage(flags flag.FlagSet, aliases []alias) func() {
 			}
 			fmt.Printf("%-30s %s\n", output, f.Usage)
 		})
+		fmt.Printf("\n%-30s %s\n", "migrate-database", "Migrate an old database to a new database (e.g. SQLite to Redis)")
+		fmt.Printf("%-30s %s\n", "--source", "Original database path")
+		fmt.Printf("%-30s %s\n", "--destination", "New database path")
+
 	}
 }
 
@@ -115,18 +182,24 @@ func getAliasedInt(flag1, flag2 *int) int {
 
 // MainFlags holds info for the parsed program arguments
 type MainFlags struct {
-	ShowVersion      bool
-	Reconfigure      bool
-	CreateSsl        bool
-	ConfigPath       string
-	ConfigDir        string
-	DataDir          string
-	Port             int
-	IsConfigPathSet  bool
-	IsConfigDirSet   bool
-	IsDataDirSet     bool
-	IsPortSet        bool
-	DisableCorsCheck bool
+	ConfigPath         string
+	ConfigDir          string
+	DataDir            string
+	DatabaseUrl        string
+	DeploymentPassword string
+	ShowVersion        bool
+	Reconfigure        bool
+	CreateSsl          bool
+	IsConfigPathSet    bool
+	IsConfigDirSet     bool
+	IsDataDirSet       bool
+	IsPortSet          bool
+	IsDatabaseUrlSet   bool
+	DisableCorsCheck   bool
+	InstallService     bool
+	UninstallService   bool
+	Port               int
+	Migration          MigrateFlags
 }
 
 func (mf *MainFlags) setBoolValues() {
@@ -134,6 +207,7 @@ func (mf *MainFlags) setBoolValues() {
 	mf.IsConfigDirSet = mf.ConfigDir != ""
 	mf.IsDataDirSet = mf.DataDir != ""
 	mf.IsPortSet = mf.Port != 0
+	mf.IsDatabaseUrlSet = mf.DatabaseUrl != ""
 }
 
 type alias struct {

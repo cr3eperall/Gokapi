@@ -37,12 +37,51 @@ func IsEqualString(t MockT, got, want string) {
 	}
 }
 
-// ResponseBodyContains fails test if http response does contain string
+// ResponseBodyContains fails test if http response does not contain the string
 func ResponseBodyContains(t MockT, got *httptest.ResponseRecorder, want string) {
 	t.Helper()
-	result, _ := io.ReadAll(got.Result().Body)
+	result, err := io.ReadAll(got.Result().Body)
+	IsNil(t, err)
 	if !strings.Contains(string(result), want) {
-		t.Errorf("Assertion failed, got: %s, want: %s.", got, want)
+		t.Errorf("Assertion failed, got: %v \n want: %s.\n\n", got, want)
+	}
+}
+
+// ResponseIsRedirect fails test if not correct redirect
+func ResponseIsRedirect(t MockT, got *httptest.ResponseRecorder, wantUrl string, ignoreParam bool) {
+	t.Helper()
+	IsEqualInt(t, got.Code, http.StatusTemporaryRedirect)
+	location := got.Header().Get("Location")
+	if ignoreParam {
+		location = strings.Split(location, "?")[0]
+	}
+	if !strings.HasSuffix(location, wantUrl) {
+		t.Errorf("Redirect Location mismatch: got %s, want to end with %s", location, wantUrl)
+	}
+}
+
+// ResponseBodyIs fails test if http response is not the exact string
+func ResponseBodyIs(t MockT, got *httptest.ResponseRecorder, want string) {
+	t.Helper()
+	result, err := io.ReadAll(got.Result().Body)
+	IsNil(t, err)
+	IsEqualString(t, string(result), want)
+}
+
+// ResponseBodyIsWithAlternate fails test if http response is not the exact string of one of the supplied string
+func ResponseBodyIsWithAlternate(t MockT, got *httptest.ResponseRecorder, want []string) {
+	t.Helper()
+	result, err := io.ReadAll(got.Result().Body)
+	IsNil(t, err)
+	found := false
+	for _, wantedString := range want {
+		if string(result) == wantedString {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Assertion failed, got: %v \n want: %s.\n\n", got, want)
 	}
 }
 
@@ -59,14 +98,6 @@ func IsEqualBool(t MockT, got, want bool) {
 	t.Helper()
 	if got != want {
 		t.Errorf("Assertion failed, got: %t, want: %t.", got, want)
-	}
-}
-
-// IsEqualStruct fails test if got and want are not identical
-func IsEqualStruct(t MockT, got, want any) {
-	t.Helper()
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("Assertion failed, got: %+v, want: %+v.", got, want)
 	}
 }
 
@@ -132,6 +163,20 @@ func FileExists(t MockT, name string) {
 	}
 }
 
+// FolderExists fails test a folder does not exist
+func FolderExists(t MockT, name string) {
+	t.Helper()
+	_, err := os.Stat(name)
+	if err == nil {
+		return
+	}
+	if !os.IsNotExist(err) {
+		t.Errorf("Assertion failed, folder does not exist: %s, want: Exists.", name)
+	} else {
+		t.Errorf("Assertion failed, could not check if folder exist: %s.", name)
+	}
+}
+
 // FileDoesNotExist fails test a file exists
 func FileDoesNotExist(t MockT, name string) {
 	t.Helper()
@@ -154,6 +199,14 @@ func IsNotNil(t MockT, got any) {
 	t.Helper()
 	if got == nil {
 		t.Errorf("Assertion failed, got: nil, want: not nil.")
+	}
+}
+
+// IsEqual fails test if got and want are not identical
+func IsEqual(t MockT, got, expected any) {
+	t.Helper()
+	if !reflect.DeepEqual(got, expected) {
+		t.Errorf("Assertion failed, not equal: %v and %v", got, expected)
 	}
 }
 
@@ -216,6 +269,12 @@ func HttpPageResult(t MockT, config HttpTestConfig) []*http.Cookie {
 	config.init(t)
 	client := &http.Client{}
 
+	if config.RedirectUrl != "" {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+
 	data := url.Values{}
 	for _, value := range config.PostValues {
 		data.Add(value.Key, value.Value)
@@ -269,42 +328,56 @@ func HttpPageResultJson(t MockT, config HttpTestConfig) []*http.Cookie {
 
 func checkResponse(t MockT, response *http.Response, config HttpTestConfig) {
 	t.Helper()
-	IsEqualBool(t, response != nil, true)
+	if response == nil {
+		t.Errorf("No response received")
+		return
+	}
 	if response.StatusCode != config.ResultCode {
-		t.Errorf("Status Code - Got: %d Want: %d", config.ResultCode, response.StatusCode)
+		t.Errorf("Status Code - Got: %d Want: %d", response.StatusCode, config.ResultCode)
 	}
 
 	content, err := io.ReadAll(response.Body)
 	IsNil(t, err)
 	if config.IsHtml && !bytes.Contains(content, []byte("</html>")) {
-		t.Errorf(config.Url + ": Incorrect response, no HTML tag")
+		t.Errorf("%s: Incorrect response, no HTML tag", config.Url)
+	}
+	if config.RedirectUrl != "" {
+		location := response.Header.Get("Location")
+		if config.IgnoreRedirectParm {
+			location = strings.Split(location, "?")[0]
+		}
+		if !strings.HasSuffix(location, config.RedirectUrl) {
+			t.Errorf("Redirect Location mismatch: got %s, want to end with %s", location, config.RedirectUrl)
+		}
 	}
 	for _, requiredString := range config.RequiredContent {
 		if !bytes.Contains(content, []byte(requiredString)) {
-			t.Errorf(config.Url + ": Incorrect response. Got:\n" + string(content))
+			t.Errorf("%s: Incorrect response. Got:\n%s", config.Url, string(content))
 		}
 	}
 	for _, excludedString := range config.ExcludedContent {
 		if bytes.Contains(content, []byte(excludedString)) {
-			t.Errorf(config.Url + ": Incorrect response. Got:\n" + string(content))
+			t.Errorf("%s: Incorrect response. Got:\n%s", config.Url, string(content))
 		}
 	}
 }
 
 // HttpTestConfig is a struct for http test init
 type HttpTestConfig struct {
-	Url             string
-	RequiredContent []string
-	ExcludedContent []string
-	IsHtml          bool
-	Method          string
-	PostValues      []PostBody
-	Cookies         []Cookie
-	Headers         []Header
-	UploadFileName  string
-	UploadFieldName string
-	ResultCode      int
-	Body            io.Reader
+	Url                string
+	RequiredContent    []string
+	ExcludedContent    []string
+	IsHtml             bool
+	IgnoreRedirectParm bool
+	Method             string
+	PostValues         []PostBody
+	Cookies            []Cookie
+	Headers            []Header
+	UploadFileName     string
+	UploadFieldName    string
+	RedirectUrl        string
+	ResultCode         int
+	Body               io.Reader
 }
 
 func (c *HttpTestConfig) init(t MockT) {
@@ -316,7 +389,11 @@ func (c *HttpTestConfig) init(t MockT) {
 		c.Method = "GET"
 	}
 	if c.ResultCode == 0 {
-		c.ResultCode = 200
+		if c.RedirectUrl == "" {
+			c.ResultCode = 200
+		} else {
+			c.ResultCode = 307
+		}
 	}
 }
 
@@ -358,7 +435,6 @@ func HttpPostUploadRequest(t MockT, config HttpTestConfig) {
 	response, err := client.Do(request)
 	IsNil(t, err)
 	defer response.Body.Close()
-
 	checkResponse(t, response, config)
 }
 
@@ -401,7 +477,15 @@ func HttpPostRequest(t MockT, config HttpTestConfig) []*http.Cookie {
 		})
 	}
 	r.Header.Set("Content-type", "application/x-www-form-urlencoded")
+	for _, header := range config.Headers {
+		r.Header.Set(header.Name, header.Value)
+	}
 	client := &http.Client{}
+	if config.RedirectUrl != "" {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
 	response, err := client.Do(r)
 	IsNil(t, err)
 	defer response.Body.Close()

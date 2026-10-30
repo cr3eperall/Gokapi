@@ -2,6 +2,17 @@ package storage
 
 import (
 	"bytes"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http/httptest"
+	"net/textproto"
+	"os"
+	"strings"
+	"testing"
+	"testing/synctest"
+	"time"
+
 	"github.com/forceu/gokapi/internal/configuration"
 	"github.com/forceu/gokapi/internal/configuration/cloudconfig"
 	"github.com/forceu/gokapi/internal/configuration/database"
@@ -10,25 +21,15 @@ import (
 	"github.com/forceu/gokapi/internal/models"
 	"github.com/forceu/gokapi/internal/storage/chunking"
 	"github.com/forceu/gokapi/internal/storage/filesystem/s3filesystem/aws"
-	"github.com/forceu/gokapi/internal/storage/processingstatus"
 	"github.com/forceu/gokapi/internal/test"
 	"github.com/forceu/gokapi/internal/test/testconfiguration"
 	"github.com/forceu/gokapi/internal/webserver/downloadstatus"
-	"github.com/r3labs/sse/v2"
-	"io"
-	"io/ioutil"
-	"mime/multipart"
-	"net/http/httptest"
-	"net/textproto"
-	"os"
-	"testing"
-	"time"
 )
 
 func TestMain(m *testing.M) {
 	testconfiguration.Create(true)
 	configuration.Load()
-	processingstatus.Init(sse.New())
+	configuration.ConnectDatabase()
 	var testserver *httptest.Server
 	if testconfiguration.UseMockS3Server() {
 		testserver = testconfiguration.StartS3TestServer()
@@ -46,7 +47,10 @@ var idNewFile string
 func TestGetFile(t *testing.T) {
 	_, result := GetFile("invalid")
 	test.IsEqualBool(t, result, false)
+
 	file, result := GetFile("Wzol7LyY2QVczXynJtVo")
+	fmt.Println(configuration.Get().DataDir)
+	fmt.Println(configuration.Get().DatabaseUrl)
 	test.IsEqualBool(t, result, true)
 	test.IsEqualString(t, file.Id, "Wzol7LyY2QVczXynJtVo")
 	test.IsEqualString(t, file.Name, "smallfile2")
@@ -67,6 +71,25 @@ func TestGetFile(t *testing.T) {
 	_, result = GetFile(file.Id)
 	test.IsEqualBool(t, result, false)
 
+	// Test pending deletion - file should not be retrievable when pending deletion
+	pendingFile := models.File{
+		Id:                 "testpendingdelete",
+		Name:               "testpendingdelete",
+		SHA1:               "e017693e4a04a59d0b0f400fe98177fe7ee13cf7",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		PendingDeletion:    time.Now().Add(time.Hour).Unix(),
+	}
+	database.SaveMetaData(pendingFile)
+	_, result = GetFile(pendingFile.Id)
+	test.IsEqualBool(t, result, false)
+	// Clean up - cancel pending deletion to allow normal retrieval
+	pendingFile.PendingDeletion = 0
+	database.SaveMetaData(pendingFile)
+	_, result = GetFile(pendingFile.Id)
+	test.IsEqualBool(t, result, true)
+	// Clean up test data
+	database.DeleteMetaData(pendingFile.Id)
 }
 
 func TestGetEncInfoFromExistingFile(t *testing.T) {
@@ -112,10 +135,10 @@ func TestGetFileByHotlink(t *testing.T) {
 }
 
 func TestAddHotlink(t *testing.T) {
-	file := models.File{Name: "test.dat", Id: "testId"}
+	file := models.File{Name: "test.dat", Id: "testId", ContentType: "image/jpg"}
 	AddHotlink(&file)
 	test.IsEqualString(t, file.HotlinkId, "")
-	file = models.File{Name: "test.jpg", Id: "testId", ExpireAt: time.Now().Add(time.Hour).Unix()}
+	file = models.File{Name: "test.jpg", Id: "testId", ExpireAt: time.Now().Add(time.Hour).Unix(), ContentType: "image/jpg"}
 	AddHotlink(&file)
 	test.IsEqualInt(t, len(file.HotlinkId), 44)
 	lastCharacters := file.HotlinkId[len(file.HotlinkId)-4:]
@@ -123,7 +146,7 @@ func TestAddHotlink(t *testing.T) {
 	link, ok := database.GetHotlink(file.HotlinkId)
 	test.IsEqualBool(t, ok, true)
 	test.IsEqualString(t, link, "testId")
-	file = models.File{Name: "test.jpg", Id: "testId", ExpireAt: time.Now().Add(time.Hour).Unix()}
+	file = models.File{Name: "test.jpg", Id: "testId", ExpireAt: time.Now().Add(time.Hour).Unix(), ContentType: "image/jpg"}
 	file.Encryption.IsEncrypted = true
 	file.AwsBucket = "test"
 	AddHotlink(&file)
@@ -132,12 +155,13 @@ func TestAddHotlink(t *testing.T) {
 
 type testFile struct {
 	File    models.File
-	Request models.UploadRequest
+	Request models.UploadParameters
 	Header  multipart.FileHeader
+	UserId  int
 	Content []byte
 }
 
-func createRawTestFile(content []byte) (multipart.FileHeader, models.UploadRequest) {
+func createRawTestFile(content []byte) (multipart.FileHeader, models.UploadParameters) {
 	os.Setenv("TZ", "UTC")
 	mimeHeader := make(textproto.MIMEHeader)
 	mimeHeader.Set("Content-Disposition", "form-data; name=\"file\"; filename=\"test.dat\"")
@@ -147,7 +171,7 @@ func createRawTestFile(content []byte) (multipart.FileHeader, models.UploadReque
 		Header:   mimeHeader,
 		Size:     int64(len(content)),
 	}
-	request := models.UploadRequest{
+	request := models.UploadParameters{
 		AllowedDownloads: 1,
 		Expiry:           999,
 		ExpiryTimestamp:  2147483600,
@@ -159,16 +183,17 @@ func createRawTestFile(content []byte) (multipart.FileHeader, models.UploadReque
 func createTestFile() (testFile, error) {
 	content := []byte("This is a file for testing purposes")
 	header, request := createRawTestFile(content)
-	file, err := NewFile(bytes.NewReader(content), &header, request)
+	file, err := NewFile(bytes.NewReader(content), &header, 63, request)
 	return testFile{
 		File:    file,
 		Request: request,
 		Header:  header,
 		Content: content,
+		UserId:  63,
 	}, err
 }
 
-func createTestChunk() (string, chunking.FileHeader, models.UploadRequest, error) {
+func createTestChunk() (string, chunking.FileHeader, models.UploadParameters, error) {
 	content := []byte("This is a file for chunk testing purposes")
 	header, request := createRawTestFile(content)
 	chunkId := helper.GenerateRandomString(15)
@@ -177,9 +202,9 @@ func createTestChunk() (string, chunking.FileHeader, models.UploadRequest, error
 		ContentType: header.Header.Get("Content-Type"),
 		Size:        header.Size,
 	}
-	err := ioutil.WriteFile("test/data/chunk-"+chunkId, content, 0600)
+	err := os.WriteFile("test/data/chunk-"+chunkId, content, 0600)
 	if err != nil {
-		return "", chunking.FileHeader{}, models.UploadRequest{}, err
+		return "", chunking.FileHeader{}, models.UploadParameters{}, err
 	}
 	return chunkId, fileheader, request, nil
 }
@@ -199,30 +224,33 @@ func TestNewFile(t *testing.T) {
 	test.IsEqualString(t, retrievedFile.HotlinkId, "")
 	test.IsEqualString(t, retrievedFile.PasswordHash, "")
 	test.IsEqualString(t, retrievedFile.Size, "35 B")
-	test.IsEqualString(t, retrievedFile.ExpireAtString, "2038-01-19 03:13")
 	test.IsEqualInt(t, retrievedFile.DownloadsRemaining, 1)
-	test.IsEqualInt(t, len(retrievedFile.Id), 20)
+	test.IsEqualInt(t, len(retrievedFile.Id), 15)
 	test.IsEqualInt(t, int(retrievedFile.ExpireAt), 2147483600)
 	test.IsEqualBool(t, file.UnlimitedTime, false)
 	test.IsEqualBool(t, file.UnlimitedDownloads, false)
 	idNewFile = file.Id
 
 	request.UnlimitedDownload = true
-	file, err = NewFile(bytes.NewReader(content), &header, request)
+	file, err = NewFile(bytes.NewReader(content), &header, 99, request)
 	test.IsNil(t, err)
+	test.IsEqualInt(t, file.UserId, 99)
 	test.IsEqualBool(t, file.UnlimitedTime, false)
 	test.IsEqualBool(t, file.UnlimitedDownloads, true)
 	request.UnlimitedDownload = false
 	request.UnlimitedTime = true
-	file, err = NewFile(bytes.NewReader(content), &header, request)
+	file, err = NewFile(bytes.NewReader(content), &header, 99, request)
 	test.IsNil(t, err)
 	test.IsEqualBool(t, file.UnlimitedTime, true)
 	test.IsEqualBool(t, file.UnlimitedDownloads, false)
 	request.UnlimitedDownload = true
-	file, err = NewFile(bytes.NewReader(content), &header, request)
+	file, err = NewFile(bytes.NewReader(content), &header, 99, request)
 	test.IsNil(t, err)
 	test.IsEqualBool(t, file.UnlimitedTime, true)
 	test.IsEqualBool(t, file.UnlimitedDownloads, true)
+
+	withinLastSecond := file.UploadDate >= time.Now().Add(-1*time.Second).Unix() && file.UploadDate <= time.Now().Unix()
+	test.IsEqualBool(t, withinLastSecond, true)
 
 	createBigFile("bigfile", 20)
 	bigFile, _ := os.Open("bigfile")
@@ -234,14 +262,14 @@ func TestNewFile(t *testing.T) {
 		Header:   mimeHeader,
 		Size:     int64(20) * 1024 * 1024,
 	}
-	request = models.UploadRequest{
+	request = models.UploadParameters{
 		AllowedDownloads: 1,
 		Expiry:           999,
 		ExpiryTimestamp:  2147483600,
 		MaxMemory:        10,
 	}
 	// Also testing renaming of temp file
-	file, err = NewFile(bigFile, &header, request)
+	file, err = NewFile(bigFile, &header, 99, request)
 	test.IsNil(t, err)
 	retrievedFile, ok = database.GetMetaDataById(file.Id)
 	test.IsEqualBool(t, ok, true)
@@ -267,13 +295,13 @@ func TestNewFile(t *testing.T) {
 		Header:   mimeHeader,
 		Size:     int64(50) * 1024 * 1024,
 	}
-	request = models.UploadRequest{
+	request = models.UploadParameters{
 		AllowedDownloads: 1,
 		Expiry:           999,
 		ExpiryTimestamp:  2147483600,
 		MaxMemory:        10,
 	}
-	file, err = NewFile(bigFile, &header, request)
+	file, err = NewFile(bigFile, &header, 99, request)
 	test.IsNotNil(t, err)
 	retrievedFile, ok = database.GetMetaDataById(file.Id)
 	test.IsEqualBool(t, ok, false)
@@ -299,7 +327,7 @@ func TestNewFile(t *testing.T) {
 	createBigFile("bigfile", 20)
 	header.Size = int64(20) * 1024 * 1024
 	bigFile, _ = os.Open("bigfile")
-	file, err = NewFile(bigFile, &header, request)
+	file, err = NewFile(bigFile, &header, 99, request)
 	test.IsNil(t, err)
 	retrievedFile, ok = database.GetMetaDataById(file.Id)
 	test.IsEqualBool(t, ok, true)
@@ -310,7 +338,7 @@ func TestNewFile(t *testing.T) {
 	database.DeleteMetaData(retrievedFile.Id)
 
 	bigFile, _ = os.Open("bigfile")
-	file, err = NewFile(bigFile, &header, request)
+	file, err = NewFile(bigFile, &header, 99, request)
 	test.IsNil(t, err)
 	retrievedFile, ok = database.GetMetaDataById(file.Id)
 	test.IsEqualBool(t, ok, true)
@@ -325,7 +353,7 @@ func TestNewFile(t *testing.T) {
 			Header:   mimeHeader,
 			Size:     int64(20) * 1024 * 1024,
 		}
-		request = models.UploadRequest{
+		request = models.UploadParameters{
 			AllowedDownloads: 1,
 			Expiry:           999,
 			ExpiryTimestamp:  2147483600,
@@ -336,7 +364,7 @@ func TestNewFile(t *testing.T) {
 		test.IsEqualBool(t, ok, true)
 		ok = aws.Init(config.Aws)
 		test.IsEqualBool(t, ok, true)
-		file, err = NewFile(bytes.NewReader(content), &header, request)
+		file, err = NewFile(bytes.NewReader(content), &header, 99, request)
 		test.IsNil(t, err)
 		retrievedFile, ok = database.GetMetaDataById(file.Id)
 		test.IsEqualBool(t, ok, true)
@@ -351,12 +379,11 @@ func TestNewFileFromChunk(t *testing.T) {
 	test.FileDoesNotExist(t, "test/data/6cca7a6905774e6d61a77dca3ad7a1f44581d6ab")
 	id, header, request, err := createTestChunk()
 	test.IsNil(t, err)
-	file, err := NewFileFromChunk(id, header, request)
+	file, err := NewFileFromChunk(id, header, 99, request)
 	test.IsNil(t, err)
 	test.IsEqualString(t, file.Name, "test.dat")
 	test.IsEqualString(t, file.Size, "41 B")
 	test.IsEqualString(t, file.SHA1, "6cca7a6905774e6d61a77dca3ad7a1f44581d6ab")
-	test.IsEqualString(t, file.ExpireAtString, "2038-01-19 03:13")
 	test.IsEqualInt64(t, file.ExpireAt, 2147483600)
 	test.IsEqualInt(t, file.DownloadsRemaining, 1)
 	test.IsEqualInt(t, file.DownloadCount, 0)
@@ -369,19 +396,18 @@ func TestNewFileFromChunk(t *testing.T) {
 	test.FileDoesNotExist(t, "test/data/chunk-"+id)
 	retrievedFile, ok := database.GetMetaDataById(file.Id)
 	test.IsEqualBool(t, ok, true)
-	test.IsEqualStruct(t, file, retrievedFile)
+	test.IsEqual(t, file, retrievedFile)
 
 	id, header, request, err = createTestChunk()
 	header.Filename = "newfile"
 	request.UnlimitedTime = true
 	request.UnlimitedDownload = true
 	test.IsNil(t, err)
-	file, err = NewFileFromChunk(id, header, request)
+	file, err = NewFileFromChunk(id, header, 99, request)
 	test.IsNil(t, err)
 	test.IsEqualString(t, file.Name, "newfile")
 	test.IsEqualString(t, file.Size, "41 B")
 	test.IsEqualString(t, file.SHA1, "6cca7a6905774e6d61a77dca3ad7a1f44581d6ab")
-	test.IsEqualString(t, file.ExpireAtString, "2038-01-19 03:13")
 	test.IsEqualInt64(t, file.ExpireAt, 2147483600)
 	test.IsEqualInt(t, file.DownloadsRemaining, 1)
 	test.IsEqualInt(t, file.DownloadCount, 0)
@@ -394,19 +420,21 @@ func TestNewFileFromChunk(t *testing.T) {
 	test.FileDoesNotExist(t, "test/data/chunk-"+id)
 	retrievedFile, ok = database.GetMetaDataById(file.Id)
 	test.IsEqualBool(t, ok, true)
-	test.IsEqualStruct(t, file, retrievedFile)
+	test.IsEqual(t, file, retrievedFile)
+	withinLastSecond := file.UploadDate >= time.Now().Add(-1*time.Second).Unix() && file.UploadDate <= time.Now().Unix()
+	test.IsEqualBool(t, withinLastSecond, true)
 	err = os.Remove("test/data/6cca7a6905774e6d61a77dca3ad7a1f44581d6ab")
 	test.IsNil(t, err)
 
-	_, err = NewFileFromChunk("invalid", header, request)
+	_, err = NewFileFromChunk("invalid", header, 99, request)
 	test.IsNotNil(t, err)
 	id, header, request, err = createTestChunk()
 	test.IsNil(t, err)
 	header.Size = 100000
-	file, err = NewFileFromChunk(id, header, request)
+	file, err = NewFileFromChunk(id, header, 99, request)
 	test.IsNotNil(t, err)
 
-	_, err = NewFileFromChunk("", header, request)
+	_, err = NewFileFromChunk("", header, 99, request)
 	test.IsNotNil(t, err)
 
 	if aws.IsIncludedInBuild {
@@ -417,12 +445,12 @@ func TestNewFileFromChunk(t *testing.T) {
 		test.IsEqualBool(t, ok, true)
 		id, header, request, err = createTestChunk()
 		test.IsNil(t, err)
-		file, err = NewFileFromChunk(id, header, request)
+		file, err = NewFileFromChunk(id, header, 99, request)
 		test.IsNil(t, err)
 		test.IsEqualBool(t, file.AwsBucket != "", true)
 		test.IsEqualString(t, file.SHA1, "6cca7a6905774e6d61a77dca3ad7a1f44581d6ab")
 		retrievedFile, ok = database.GetMetaDataById(file.Id)
-		test.IsEqualStruct(t, file, retrievedFile)
+		test.IsEqual(t, file, retrievedFile)
 		test.IsEqualBool(t, ok, true)
 		testconfiguration.DisableS3()
 	}
@@ -438,7 +466,7 @@ func TestDuplicateFile(t *testing.T) {
 	retrievedFile.DownloadCount = 5
 	database.SaveMetaData(retrievedFile)
 
-	newFile, err := DuplicateFile(retrievedFile, 0, "123", models.UploadRequest{})
+	newFile, err := DuplicateFile(retrievedFile, 0, "123", models.UploadParameters{})
 	test.IsNil(t, err)
 	test.IsEqualInt(t, newFile.DownloadCount, 0)
 	test.IsEqualInt(t, newFile.DownloadsRemaining, 1)
@@ -448,7 +476,7 @@ func TestDuplicateFile(t *testing.T) {
 	test.IsEqualBool(t, newFile.UnlimitedTime, false)
 	test.IsEqualString(t, newFile.Name, "test.dat")
 
-	uploadRequest := models.UploadRequest{
+	uploadRequest := models.UploadParameters{
 		AllowedDownloads:  5,
 		Expiry:            5,
 		ExpiryTimestamp:   200000,
@@ -547,11 +575,11 @@ func TestServeFile(t *testing.T) {
 	test.IsEqualBool(t, result, true)
 	r := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
-	ServeFile(file, w, r, true)
+	ServeFile(file, w, r, true, true, false, false)
 	_, result = GetFile(idNewFile)
 	test.IsEqualBool(t, result, false)
 
-	test.IsEqualString(t, w.Result().Header.Get("Content-Disposition"), "attachment; filename=\"test.dat\"")
+	test.IsEqualString(t, w.Result().Header.Get("Content-Disposition"), "attachment; filename=\"test.dat\"; filename*=UTF-8''test.dat")
 	test.IsEqualString(t, w.Result().Header.Get("Content-Length"), "35")
 	test.IsEqualString(t, w.Result().Header.Get("Content-Type"), "text/plain")
 	content, err := io.ReadAll(w.Result().Body)
@@ -568,7 +596,7 @@ func TestServeFile(t *testing.T) {
 		w = httptest.NewRecorder()
 		file, result = GetFile("awsTest1234567890123")
 		test.IsEqualBool(t, result, true)
-		ServeFile(file, w, r, false)
+		ServeFile(file, w, r, false, true, false, false)
 		if aws.IsMockApi {
 			test.ResponseBodyContains(t, w, "https://redirect.url")
 		} else {
@@ -593,7 +621,7 @@ func TestServeFile(t *testing.T) {
 	file.Encryption.Nonce = nonce
 	r = httptest.NewRequest("GET", "/", nil)
 	w = httptest.NewRecorder()
-	ServeFile(file, w, r, true)
+	ServeFile(file, w, r, true, true, false, false)
 	test.ResponseBodyContains(t, w, "Error decrypting file")
 }
 
@@ -691,6 +719,7 @@ func TestCleanUp(t *testing.T) {
 func TestDeleteFile(t *testing.T) {
 	testconfiguration.Create(true)
 	configuration.Load()
+	configuration.ConnectDatabase()
 	files := database.GetAllMetadata()
 	test.IsEqualString(t, files["n1tSTAGj8zan9KaT4u6p"].Name, "picture.jpg")
 	test.FileExists(t, "test/data/a8fdc205a9f19cc1c7507a60c4f01b13d11d7fd0")
@@ -777,26 +806,190 @@ func TestDeleteAllEncrypted(t *testing.T) {
 	data, ok = database.GetMetaDataById("testEncDelUn")
 	test.IsEqualBool(t, ok, true)
 	test.IsEqualBool(t, data.UnlimitedTime, true)
-	DeleteAllEncrypted()
-	data, ok = database.GetMetaDataById("testEncDelEnc")
-	test.IsEqualBool(t, ok, true)
-	test.IsEqualBool(t, data.UnlimitedTime, false)
-	data, ok = database.GetMetaDataById("testEncDelUn")
-	test.IsEqualBool(t, ok, true)
-	test.IsEqualBool(t, data.UnlimitedTime, true)
 }
 
-func TestWriteDownloadHeaders(t *testing.T) {
-	file := models.File{Name: "testname", ContentType: "testtype"}
-	w, _ := test.GetRecorder("GET", "/test", nil, nil, nil)
-	writeDownloadHeaders(file, w, true)
-	test.IsEqualString(t, w.Result().Header.Get("Content-Disposition"), "attachment; filename=\"testname\"")
-	w, _ = test.GetRecorder("GET", "/test", nil, nil, nil)
-	writeDownloadHeaders(file, w, false)
-	test.IsEqualString(t, w.Result().Header.Get("Content-Disposition"), "inline; filename=\"testname\"")
-	test.IsEqualString(t, w.Result().Header.Get("Content-Type"), "testtype")
-	file.Encryption.IsEncrypted = true
-	w, _ = test.GetRecorder("GET", "/test", nil, nil, nil)
-	writeDownloadHeaders(file, w, false)
-	test.IsEqualString(t, w.Result().Header.Get("Accept-Ranges"), "bytes")
+func TestReplaceFile(t *testing.T) {
+	originalFile := models.File{
+		Id:                 "originalfiletest",
+		Name:               "old.txt",
+		Size:               "1KB",
+		SHA1:               "replacetest1",
+		ContentType:        "text/plain",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		AwsBucket:          "",
+		SizeBytes:          1024,
+		Encryption: models.EncryptionInfo{
+			IsEncrypted:         false,
+			IsEndToEndEncrypted: false,
+			DecryptionKey:       nil,
+			Nonce:               nil,
+		},
+	}
+
+	newFile := models.File{
+		Id:                 "newfiletest",
+		Name:               "new.txt",
+		Size:               "2KB",
+		SHA1:               "replacetest2",
+		ContentType:        "text/plain2",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		AwsBucket:          "",
+		SizeBytes:          2048,
+		Encryption: models.EncryptionInfo{
+			IsEncrypted:         true,
+			IsEndToEndEncrypted: false,
+			DecryptionKey:       []byte("key"),
+			Nonce:               []byte("nonce"),
+		},
+	}
+
+	e2eFile := models.File{
+		Id:                 "e2eFile",
+		Name:               "e2eFile",
+		Size:               "1KB",
+		UnlimitedDownloads: true,
+		UnlimitedTime:      true,
+		SHA1:               "replacetest3",
+		Encryption: models.EncryptionInfo{
+			IsEncrypted:         true,
+			IsEndToEndEncrypted: true,
+		},
+	}
+	database.SaveMetaData(originalFile)
+	_, ok := database.GetMetaDataById(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	_, ok = GetFile(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	database.SaveMetaData(newFile)
+	_, ok = database.GetMetaDataById(newFile.Id)
+	test.IsEqualBool(t, ok, true)
+	database.SaveMetaData(e2eFile)
+	_, ok = database.GetMetaDataById(e2eFile.Id)
+	test.IsEqualBool(t, ok, true)
+	_, err := ReplaceFile("invalidfile", originalFile.Id, false)
+	test.IsNotNil(t, err)
+	_, err = ReplaceFile(originalFile.Id, "invalidfile", false)
+	test.IsNotNil(t, err)
+	_, err = ReplaceFile(originalFile.Id, e2eFile.Id, false)
+	test.IsNotNil(t, err)
+
+	_, err = ReplaceFile(originalFile.Id, newFile.Id, false)
+	test.IsNil(t, err)
+	file, ok := GetFile(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	test.IsEqualString(t, file.Name, newFile.Name)
+	test.IsEqualString(t, file.SHA1, newFile.SHA1)
+	test.IsEqualString(t, file.ContentType, newFile.ContentType)
+	test.IsEqualString(t, file.AwsBucket, newFile.AwsBucket)
+	test.IsEqualString(t, file.Size, newFile.Size)
+	test.IsEqualInt64(t, file.SizeBytes, newFile.SizeBytes)
+	test.IsEqual(t, file.Encryption, newFile.Encryption)
+	_, ok = GetFile(newFile.Id)
+	test.IsEqualBool(t, ok, true)
+
+	_, err = ReplaceFile(originalFile.Id, newFile.Id, true)
+	_, ok = GetFile(originalFile.Id)
+	test.IsEqualBool(t, ok, true)
+	_, ok = GetFile(newFile.Id)
+	test.IsEqualBool(t, ok, false)
+}
+func TestParallelDownloads(t *testing.T) {
+	const allowedDownloads = 5
+
+	singleDownloadFile := models.File{
+		Id:                 "only5downloads",
+		Name:               "only5downloads.txt",
+		Size:               "1KB",
+		SHA1:               "replacetest1",
+		ContentType:        "text/plain",
+		DownloadsRemaining: allowedDownloads,
+		UnlimitedDownloads: false,
+		UnlimitedTime:      true,
+		AwsBucket:          "",
+		SizeBytes:          1024,
+		Encryption: models.EncryptionInfo{
+			IsEncrypted:         false,
+			IsEndToEndEncrypted: false,
+			DecryptionKey:       nil,
+			Nonce:               nil,
+		},
+	}
+	database.SaveMetaData(singleDownloadFile)
+
+	synctest.Test(t, func(t *testing.T) {
+		const workers = 50
+		results := make(chan bool, workers)
+
+		for i := 0; i < workers; i++ {
+			go func() {
+				w := httptest.NewRecorder()
+				r := httptest.NewRequest("GET", "/"+singleDownloadFile.Id, nil)
+
+				// The mutex inside ServeFile should serialize the decrement logic.
+				success := ServeFile(singleDownloadFile, w, r, false, true, false, true)
+				results <- success
+			}()
+		}
+
+		synctest.Wait()
+		close(results)
+
+		var successCount int
+		var failureCount int
+
+		for res := range results {
+			if res {
+				successCount++
+			} else {
+				failureCount++
+			}
+		}
+
+		test.IsEqualInt(t, successCount, allowedDownloads)
+		test.IsEqualInt(t, failureCount, workers-allowedDownloads)
+	})
+}
+
+func TestServeFilesAsZipSanitisation(t *testing.T) {
+	r := httptest.NewRequest("GET", "/", nil)
+
+	// Path traversal in the zip filename must be neutralised before it
+	// reaches the Content-Disposition header.
+	w := httptest.NewRecorder()
+	ServeFilesAsZip([]models.File{}, "../../etc/evil", w, r)
+	cd := w.Result().Header.Get("Content-Disposition")
+	test.IsEqualBool(t, strings.HasPrefix(cd, ".."), false)
+	test.IsEqualBool(t, strings.Contains(cd, "/"), false)
+	// The header must still be a valid attachment directive.
+	test.IsEqualBool(t, strings.HasPrefix(cd, "attachment;"), true)
+
+	// CRLF in the zip filename must be stripped so it cannot split the
+	// HTTP response and inject arbitrary headers.
+	w = httptest.NewRecorder()
+	ServeFilesAsZip([]models.File{}, "bundle\r\nX-Evil: injected", w, r)
+	cd = w.Result().Header.Get("Content-Disposition")
+	test.IsEqualBool(t, strings.Contains(cd, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(cd, "\n"), false)
+	test.IsEqualString(t, r.Header.Get("X-Evil"), "")
+
+	// Null byte in filename must be stripped.
+	w = httptest.NewRecorder()
+	ServeFilesAsZip([]models.File{}, "file\x00name", w, r)
+	cd = w.Result().Header.Get("Content-Disposition")
+	test.IsEqualBool(t, strings.Contains(cd, "\x00"), false)
+
+	// An empty filename must fall back to "Gokapi" (the hardcoded default)
+	// so the Content-Disposition header is always well-formed.
+	w = httptest.NewRecorder()
+	ServeFilesAsZip([]models.File{}, "", w, r)
+	cd = w.Result().Header.Get("Content-Disposition")
+	test.IsEqualBool(t, strings.Contains(cd, "Gokapi"), true)
+
+	// A clean filename must be preserved exactly (plus the .zip suffix).
+	w = httptest.NewRecorder()
+	ServeFilesAsZip([]models.File{}, "my-archive", w, r)
+	cd = w.Result().Header.Get("Content-Disposition")
+	test.IsEqualBool(t, strings.Contains(cd, "my-archive.zip"), true)
 }

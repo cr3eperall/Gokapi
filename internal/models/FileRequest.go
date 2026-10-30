@@ -1,0 +1,103 @@
+package models
+
+import (
+	"strings"
+	"time"
+
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/storage/chunking/chunkreservation"
+)
+
+// FileRequest contains information about a file request
+type FileRequest struct {
+	Id              string   `json:"id" redis:"id"`                     // The internal ID of the file request
+	UserId          int      `json:"userid" redis:"userid"`             // The user ID of the owner
+	MaxFiles        int      `json:"maxfiles" redis:"maxfiles"`         // The maximum number of files allowed
+	MaxSize         int      `json:"maxsize" redis:"maxsize"`           // The maximum file size allowed in MB
+	Expiry          int64    `json:"expiry" redis:"expiry"`             // The expiry time of the file request
+	CreationDate    int64    `json:"creationdate" redis:"creationdate"` // The timestamp of the file request creation
+	Name            string   `json:"name" redis:"name"`                 // The given name for the file request
+	ApiKey          string   `json:"apikey" redis:"apikey"`             // The API key related to the file request
+	Notes           string   `json:"notes" redis:"notes"`               // The custom note that was set for this file request
+	UploadedFiles   int      `json:"uploadedfiles" redis:"-"`           // Contains the number of uploaded files for this request. Needs to be calculated with Populate()
+	CombinedMaxSize int      `json:"combinedmaxsize" redis:"-"`         // The lesser of MaxSize and the server's max upload size. Needs to be calculated with Populate()
+	ReservedUploads int      `json:"reserveduploads" redis:"-"`         // How many uploads are currently reserved but not finalised. Needs to be calculated with Populate()
+	LastUpload      int64    `json:"lastupload" redis:"-"`              // Contains the timestamp of the last upload for this request. Needs to be calculated with Populate()
+	TotalFileSize   int64    `json:"totalfilesize" redis:"-"`           // Contains the file size of all uploaded files. Needs to be calculated with Populate()
+	FileIdList      []string `json:"fileidlist" redis:"-"`              // Contains an array of the IDs of all uploaded files. Needs to be calculated with Populate()
+	Files           []File   `json:"-" redis:"-"`                       // Contains an array of the IDs of all uploaded files. Needs to be calculated with Populate()
+}
+
+// Populate inserts the number of uploaded files and the last upload date
+func (f *FileRequest) Populate(files map[string]File, maxServerSize int) {
+	f.FileIdList = make([]string, 0)
+	f.Files = make([]File, 0)
+	for _, file := range files {
+		if file.UploadRequestId == f.Id && !file.IsPendingForDeletion() {
+			f.TotalFileSize = f.TotalFileSize + file.SizeBytes
+			f.FileIdList = append(f.FileIdList, file.Id)
+			f.Files = append(f.Files, file)
+			if file.UploadDate > f.LastUpload {
+				f.LastUpload = file.UploadDate
+			}
+		}
+	}
+	f.CombinedMaxSize = f.MaxSize
+	if f.MaxSize == 0 || f.MaxSize > maxServerSize {
+		f.CombinedMaxSize = maxServerSize
+	}
+	f.UploadedFiles = len(f.FileIdList)
+	f.ReservedUploads = chunkreservation.GetCount(f.Id)
+}
+
+// GetReadableDateLastUpdate returns the last update date as YYYY-MM-DD HH:MM:SS
+func (f *FileRequest) GetReadableDateLastUpdate() string {
+	if f.LastUpload == 0 {
+		return "None"
+	}
+	return time.Unix(f.LastUpload, 0).Format("2006-01-02 15:04:05")
+}
+
+// GetReadableTotalSize returns the total file size in a human-readable format
+func (f *FileRequest) GetReadableTotalSize() string {
+	return helper.ByteCountSI(f.TotalFileSize)
+}
+
+// GetFilesAsString returns a comma-separated list of file IDs
+func (f *FileRequest) GetFilesAsString() string {
+	return strings.Join(f.FileIdList, ",")
+}
+
+// IsUnlimitedSize returns true if there is no size limit
+func (f *FileRequest) IsUnlimitedSize() bool {
+	return f.MaxSize == 0
+}
+
+// IsUnlimitedFiles returns true if there is no file limit
+func (f *FileRequest) IsUnlimitedFiles() bool {
+	return f.MaxFiles == 0
+}
+
+// IsUnlimitedTime returns true if there is no expiry time
+func (f *FileRequest) IsUnlimitedTime() bool {
+	return f.Expiry == 0
+}
+
+// IsExpired returns true if the file request has expired
+func (f *FileRequest) IsExpired() bool {
+	return !f.IsUnlimitedTime() && time.Now().Unix() > f.Expiry
+}
+
+// HasRestrictions returns true if the file request has any restrictions e.g. size or time limit
+func (f *FileRequest) HasRestrictions() bool {
+	return !(f.IsUnlimitedSize() && f.IsUnlimitedFiles() && f.IsUnlimitedTime())
+}
+
+// FilesRemaining returns the number of files that can still be uploaded
+func (f *FileRequest) FilesRemaining() int {
+	result := f.MaxFiles - f.UploadedFiles - f.ReservedUploads
+	if result < 0 {
+		return 0
+	}
+	return result
+}

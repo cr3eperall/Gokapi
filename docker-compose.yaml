@@ -1,0 +1,12 @@
+services:
+  gokapi:
+    image: f0rc3/gokapi:latest
+    container_name: gokapi
+    ports:
+      - "127.0.0.1:53842:53842"
+    volumes:
+      - ./gokapi-data:/app/data
+      - ./gokapi-config:/app/config
+    restart: always
+    env_file:
+      - "./.env"

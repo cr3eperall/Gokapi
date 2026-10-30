@@ -3,21 +3,28 @@
 package aws
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+
 	"github.com/forceu/gokapi/internal/configuration/cloudconfig"
 	"github.com/forceu/gokapi/internal/models"
 	"github.com/forceu/gokapi/internal/test"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
-	"net/http/httptest"
-	"os"
-	"testing"
 )
 
 var testFile, invalidFile, invalidBucket, invalidAll models.File
 
+var isRealAwsServer bool
+
 func TestMain(m *testing.M) {
 	testFile.AwsBucket = "gokapi-test"
 	testFile.SHA1 = "testfile"
+	testFile.Name = "Testfile.jpg"
 	invalidFile.AwsBucket = "gokapi-test"
 	invalidFile.SHA1 = "invalid"
 	invalidBucket.AwsBucket = "invalid"
@@ -28,6 +35,8 @@ func TestMain(m *testing.M) {
 		ts := startMockServer()
 		os.Setenv("GOKAPI_AWS_ENDPOINT", ts.URL)
 		defer ts.Close()
+	} else {
+		isRealAwsServer = true
 	}
 	exitVal := m.Run()
 	os.Exit(exitVal)
@@ -78,7 +87,7 @@ func TestUploadToAws(t *testing.T) {
 func TestDownloadFromAws(t *testing.T) {
 	test.FileDoesNotExist(t, "test")
 	file, _ := os.Create("test")
-	size, err := Download(file, testFile)
+	size, err := download(file, testFile)
 	test.IsNil(t, err)
 	test.IsEqualBool(t, size == 16, true)
 	test.FileExists(t, "test")
@@ -87,21 +96,70 @@ func TestDownloadFromAws(t *testing.T) {
 	os.Remove("test")
 }
 
-func TestRedirectToDownload(t *testing.T) {
+func TestServeFile(t *testing.T) {
+	awsConfig.ProxyDownload = false
+	testServing(t, true, false)
+	testServing(t, true, true)
+
+	awsConfig.ProxyDownload = true
+	testServing(t, false, false)
+	testServing(t, false, true)
+	awsConfig.ProxyDownload = false
+}
+
+func testServing(t *testing.T, expectRedirect, forceDownload bool) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/download", nil)
-	err := RedirectToDownload(w, r, testFile, false)
-	test.IsNil(t, err)
-	test.ResponseBodyContains(t, w, "<a href=\"http")
-	test.IsEqualInt(t, w.Code, 307)
 
-	// Test with force download
-	w = httptest.NewRecorder()
-	r = httptest.NewRequest("GET", "/download", nil)
-	err = RedirectToDownload(w, r, testFile, true)
+	isBlocking, err := ServeFile(w, r, testFile, forceDownload, false)
+	test.IsEqualBool(t, isBlocking, !expectRedirect)
 	test.IsNil(t, err)
-	test.ResponseBodyContains(t, w, "<a href=\"http")
-	test.IsEqualInt(t, w.Code, 307)
+
+	response, err := io.ReadAll(w.Result().Body)
+	test.IsNil(t, err)
+
+	if !expectRedirect {
+		test.IsEqualString(t, string(response), "testfile-content")
+		test.IsEqualInt(t, w.Code, 200)
+		// content-disposition not implemented in s3mem
+		if isRealAwsServer {
+			expectedContentDisposition := "inline; filename=\"" + testFile.Name + "\""
+			if forceDownload {
+				expectedContentDisposition = "Attachment; filename=\"" + testFile.Name + "\""
+			}
+			test.IsEqualString(t, w.Header().Get("Content-Disposition"), expectedContentDisposition)
+		}
+	} else {
+		for _, s := range []string{"<a href=\"http", "Testfile.jpg"} {
+			test.IsEqualBool(t, strings.Contains(string(response), s), true)
+		}
+		test.IsEqualInt(t, w.Code, 307)
+
+		// Get the redirect URL from the response headers
+		redirectURL := w.Header().Get("Location")
+		if redirectURL == "" {
+			t.Fatal("Expected redirect URL in Location header")
+		}
+
+		// Follow the redirect and download the content
+		resp, err := http.Get(redirectURL)
+		test.IsNil(t, err)
+		defer resp.Body.Close()
+
+		// Read the content of the downloaded file and  check the content of the downloaded file
+		downloadedContent, err := io.ReadAll(resp.Body)
+		test.IsNil(t, err)
+		test.IsEqualString(t, string(downloadedContent), "testfile-content")
+
+		// content-disposition not implemented in s3mem
+		if isRealAwsServer {
+			expectedContentDisposition := "inline; filename=\"" + testFile.Name + "\""
+			if forceDownload {
+				expectedContentDisposition = "Attachment; filename=\"" + testFile.Name + "\""
+			}
+			test.IsEqualString(t, resp.Header.Get("Content-Disposition"), expectedContentDisposition)
+		}
+	}
 }
 
 func TestFileExists(t *testing.T) {
@@ -135,4 +193,16 @@ func TestLogOut(t *testing.T) {
 	test.IsEqualBool(t, isCorrectLogin, true)
 	LogOut()
 	test.IsEqualBool(t, isCorrectLogin, false)
+}
+
+func TestGetDefaultBucketName(t *testing.T) {
+	test.IsEqualString(t, GetDefaultBucketName(), awsConfig.Bucket)
+}
+
+func TestIsCorsCorrectlySet(t *testing.T) {
+	// not implemented in s3mem
+	if !isRealAwsServer {
+		return
+	}
+	// TODO
 }

@@ -7,40 +7,51 @@ Handling of webserver and requests / uploads
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/NYTimes/gziphandler"
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/configuration/database"
-	"github.com/forceu/gokapi/internal/encryption"
-	"github.com/forceu/gokapi/internal/helper"
-	"github.com/forceu/gokapi/internal/logging"
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/forceu/gokapi/internal/storage"
-	"github.com/forceu/gokapi/internal/storage/processingstatus"
-	"github.com/forceu/gokapi/internal/webserver/api"
-	"github.com/forceu/gokapi/internal/webserver/authentication"
-	"github.com/forceu/gokapi/internal/webserver/authentication/oauth"
-	"github.com/forceu/gokapi/internal/webserver/authentication/sessionmanager"
-	"github.com/forceu/gokapi/internal/webserver/fileupload"
-	"github.com/forceu/gokapi/internal/webserver/ssl"
-	"github.com/r3labs/sse/v2"
 	"html/template"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
-	"os"
 	"sort"
+	"strconv"
 	"strings"
 	templatetext "text/template"
 	"time"
+
+	"github.com/NYTimes/gziphandler"
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/configuration/database"
+	"github.com/forceu/gokapi/internal/encryption"
+	"github.com/forceu/gokapi/internal/environment"
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/logging"
+	"github.com/forceu/gokapi/internal/logging/serverstats"
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/storage"
+	"github.com/forceu/gokapi/internal/storage/filerequest"
+	"github.com/forceu/gokapi/internal/storage/presign"
+	"github.com/forceu/gokapi/internal/webserver/api"
+	"github.com/forceu/gokapi/internal/webserver/authentication"
+	"github.com/forceu/gokapi/internal/webserver/authentication/csrftoken"
+	"github.com/forceu/gokapi/internal/webserver/authentication/downloadPasswordToken"
+	"github.com/forceu/gokapi/internal/webserver/authentication/oauth"
+	"github.com/forceu/gokapi/internal/webserver/authentication/sessionmanager"
+	"github.com/forceu/gokapi/internal/webserver/authentication/tokengeneration"
+	"github.com/forceu/gokapi/internal/webserver/errorHandling"
+	"github.com/forceu/gokapi/internal/webserver/favicon"
+	"github.com/forceu/gokapi/internal/webserver/fileupload"
+	"github.com/forceu/gokapi/internal/webserver/ratelimiter"
+	"github.com/forceu/gokapi/internal/webserver/sse"
+	"github.com/forceu/gokapi/internal/webserver/ssl"
 )
 
 // TODO add 404 handler
+
 // staticFolderEmbedded is the embedded version of the "static" folder
 // This contains JS files, CSS, images etc
 //
@@ -65,16 +76,20 @@ var wasmDownloadFile embed.FS
 //go:embed web/e2e.wasm
 var wasmE2EFile embed.FS
 
-const timeOutWebserverRead = 12 * time.Hour
+const timeOutWebserverRead = 2 * time.Hour
 const timeOutWebserverWrite = 12 * time.Hour
 
-// Variable containing all parsed templates
+// templateFolder contains all parsed templates
 var templateFolder *template.Template
 
+// customStaticInfo is passed to all templates, so custom CSS or JS can be embedded
+var customStaticInfo customStatic
+
+// imageExpiredPicture is sent for an expired hotlink
 var imageExpiredPicture []byte
 
+// srv is the web server that is used for this module
 var srv http.Server
-var sseServer *sse.Server
 
 // Start the webserver on the port set in the config
 func Start() {
@@ -83,44 +98,40 @@ func Start() {
 	var err error
 
 	mux := http.NewServeMux()
-	sseServer = sse.New()
-	sseServer.CreateStream("changes")
-	processingstatus.Init(sseServer)
-
-	if helper.FolderExists("static") {
-		fmt.Println("Found folder 'static', using local folder instead of internal static folder")
-		mux.Handle("/", http.FileServer(http.Dir("static")))
-	} else {
-		mux.Handle("/", http.FileServer(http.FS(webserverDir)))
-		helper.Check(err)
-	}
+	loadCustomCssJsInfo(webserverDir)
 	loadExpiryImage()
 
-	mux.HandleFunc("/admin", requireLogin(showAdminMenu, false))
+	mux.Handle("/", filesystemHandler(webserverDir))
+	mux.HandleFunc("/auth/token", requireLogin(handleGenerateAuthToken, false, false))
+	mux.HandleFunc("/admin", requireLogin(showAdminMenu, true, false))
 	mux.HandleFunc("/api/", processApi)
-	mux.HandleFunc("/apiDelete", requireLogin(deleteApiKey, false))
-	mux.HandleFunc("/apiKeys", requireLogin(showApiAdmin, false))
-	mux.HandleFunc("/apiNew", requireLogin(newApiKey, false))
+	mux.HandleFunc("/apiKeys", requireLogin(showApiAdmin, true, false))
+	mux.HandleFunc("/changePassword", requireLogin(changePassword, true, true))
 	mux.HandleFunc("/d", showDownload)
-	mux.HandleFunc("/delete", requireLogin(deleteFile, false))
 	mux.HandleFunc("/downloadFile", downloadFile)
-	mux.HandleFunc("/e2eInfo", requireLogin(e2eInfo, true))
-	mux.HandleFunc("/e2eSetup", requireLogin(showE2ESetup, false))
+	mux.HandleFunc("/downloadPresigned", requireLogin(downloadPresigned, false, false))
+	mux.HandleFunc("/e2eSetup", requireLogin(showE2ESetup, true, false))
 	mux.HandleFunc("/error", showError)
-	mux.HandleFunc("/error-auth", showErrorAuth)
-	mux.HandleFunc("/error-oauth", showErrorIntOAuth)
+	mux.HandleFunc("/filerequests", requireLogin(showUploadRequest, true, false))
 	mux.HandleFunc("/forgotpw", forgotPassword)
-	mux.HandleFunc("/hotlink/", showHotlink)
+	mux.HandleFunc("/h/", showHotlink)
+	mux.HandleFunc("/hotlink/", showHotlink) // backward compatibility
 	mux.HandleFunc("/index", showIndex)
 	mux.HandleFunc("/login", showLogin)
-	mux.HandleFunc("/logs", requireLogin(showLogs, false))
+	mux.HandleFunc("/logs", requireLogin(showLogs, true, false))
 	mux.HandleFunc("/logout", doLogout)
-	mux.HandleFunc("/uploadChunk", requireLogin(uploadChunk, true))
-	mux.HandleFunc("/uploadComplete", requireLogin(uploadComplete, true))
-	mux.HandleFunc("/uploadStatus", requireLogin(sseServer.ServeHTTP, false))
+	mux.HandleFunc("/publicUpload", showPublicUpload)
+	mux.HandleFunc("/uploadChunk", requireLogin(uploadChunk, false, false))
+	mux.HandleFunc("/uploadStatus", requireLogin(sse.GetStatusSSE, false, false))
+	mux.HandleFunc("/users", requireLogin(showUserAdmin, true, false))
 	mux.Handle("/main.wasm", gziphandler.GzipHandler(http.HandlerFunc(serveDownloadWasm)))
 	mux.Handle("/e2e.wasm", gziphandler.GzipHandler(http.HandlerFunc(serveE2EWasm)))
-	if configuration.Get().Authentication.Method == authentication.OAuth2 {
+	mux.HandleFunc("/d/{id}/{filename}", redirectFromFilename)
+	mux.HandleFunc("/dh/{id}/{filename}", downloadFileWithNameInUrl)
+
+	addMuxForCustomContent(mux)
+
+	if configuration.Get().Authentication.Method == models.AuthenticationOAuth2 {
 		oauth.Init(configuration.Get().ServerUrl, configuration.Get().Authentication)
 		mux.HandleFunc("/oauth-login", oauth.HandlerLogin)
 		mux.HandleFunc("/oauth-callback", oauth.HandlerCallback)
@@ -145,31 +156,48 @@ func Start() {
 		ssl.GenerateIfInvalidCert(configuration.Get().ServerUrl, false)
 		fmt.Println(infoMessage)
 		err = srv.ListenAndServeTLS(ssl.GetCertificateLocations())
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
 	} else {
 		fmt.Println(infoMessage)
 		err = srv.ListenAndServe()
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
 	}
+}
+
+func filesystemHandler(webserverDir fs.FS) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/favicon") {
+			handleFavicon(w, r)
+			return
+		}
+		addCacheHeader(w)
+		http.FileServer(http.FS(webserverDir)).ServeHTTP(w, r)
+	}
+}
+
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	icon := favicon.GetFavicon(r.URL.Path)
+	_, _ = w.Write(icon)
 }
 
 func loadExpiryImage() {
 	svgTemplate, err := templatetext.ParseFS(templateFolderEmbedded, "web/templates/expired_file_svg.tmpl")
 	helper.Check(err)
 	var buf bytes.Buffer
-	view := UploadView{}
-	err = svgTemplate.Execute(&buf, view.convertGlobalConfig(ViewMain))
+	err = svgTemplate.Execute(&buf, struct {
+		PublicName string
+	}{PublicName: configuration.Get().PublicName})
 	helper.Check(err)
 	imageExpiredPicture = buf.Bytes()
 }
 
 // Shutdown closes the webserver gracefully
 func Shutdown() {
-	sseServer.Close()
+	sse.Shutdown()
 	err := srv.Shutdown(context.Background())
 	if err != nil {
 		log.Println(err)
@@ -181,25 +209,66 @@ func Shutdown() {
 // Otherwise, templateFolderEmbedded will be used.
 func initTemplates(templateFolderEmbedded embed.FS) {
 	var err error
+
+	funcMap := template.FuncMap{
+		"newAdminButtonContext": newAdminButtonContext,
+	}
 	if helper.FolderExists("templates") {
 		fmt.Println("Found folder 'templates', using local folder instead of internal template folder")
-		templateFolder, err = template.ParseGlob("templates/*.tmpl")
+		templateFolder, err = template.New("").Funcs(funcMap).ParseGlob("templates/*.tmpl")
 		helper.Check(err)
 	} else {
-		templateFolder, err = template.ParseFS(templateFolderEmbedded, "web/templates/*.tmpl")
+		templateFolder, err = template.New("").Funcs(funcMap).ParseFS(templateFolderEmbedded, "web/templates/*.tmpl")
 		helper.Check(err)
 	}
 }
 
 // Sends a redirect HTTP output to the client. Variable url is used to redirect to ./url
-func redirect(w http.ResponseWriter, url string) {
-	_, _ = io.WriteString(w, "<html><head><meta http-equiv=\"Refresh\" content=\"0; URL=./"+url+"\"></head></html>")
+func redirect(w http.ResponseWriter, r *http.Request, url string) {
+	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+}
+
+func redirectOnIncorrectId(w http.ResponseWriter, r *http.Request, url string) {
+	ratelimiter.WaitOnFailedId(r)
+	redirect(w, r, url)
+}
+
+type redirectValues struct {
+	FileId           string
+	RedirectUrl      string
+	Name             string
+	Size             string
+	PublicName       string
+	BaseUrl          string
+	PasswordRequired bool
+}
+
+// Handling of /id/?/? - used when filename shall be displayed, will redirect to the regular download URL
+func redirectFromFilename(w http.ResponseWriter, r *http.Request) {
+	addNoCacheHeader(w)
+	id := r.PathValue("id")
+	file, ok := storage.GetFile(id)
+	if !ok {
+		redirect(w, r, "../../error")
+		return
+	}
+
+	config := configuration.Get()
+	err := templateFolder.ExecuteTemplate(w, "redirect_filename", redirectValues{
+		FileId:           id,
+		RedirectUrl:      "d",
+		Name:             file.Name,
+		Size:             file.Size,
+		PublicName:       config.PublicName,
+		BaseUrl:          config.ServerUrl,
+		PasswordRequired: file.PasswordHash != ""})
+	helper.CheckIgnoreTimeout(err)
 }
 
 // Handling of /main.wasm
 func serveDownloadWasm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Cache-Control", "public, max-age=100800") // 2 days
-	w.Header().Set("content-type", "application/wasm")
+	w.Header().Set("Content-Type", "application/wasm")
 	file, err := wasmDownloadFile.ReadFile("web/main.wasm")
 	helper.Check(err)
 	_, _ = w.Write(file)
@@ -208,7 +277,7 @@ func serveDownloadWasm(w http.ResponseWriter, r *http.Request) {
 // Handling of /e2e.wasm
 func serveE2EWasm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Cache-Control", "public, max-age=100800") // 2 days
-	w.Header().Set("content-type", "application/wasm")
+	w.Header().Set("Content-Type", "application/wasm")
 	file, err := wasmE2EFile.ReadFile("web/e2e.wasm")
 	helper.Check(err)
 	_, _ = w.Write(file)
@@ -221,121 +290,252 @@ func doLogout(w http.ResponseWriter, r *http.Request) {
 
 // Handling of /index and redirecting to globalConfig.RedirectUrl
 func showIndex(w http.ResponseWriter, r *http.Request) {
-	err := templateFolder.ExecuteTemplate(w, "index", genericView{RedirectUrl: configuration.Get().RedirectUrl, PublicName: configuration.Get().PublicName})
+	err := templateFolder.ExecuteTemplate(w, "index", genericView{RedirectUrl: configuration.Get().RedirectUrl,
+		PublicName:    configuration.Get().PublicName,
+		CustomContent: customStaticInfo})
 	helper.CheckIgnoreTimeout(err)
+}
+
+func handleGenerateAuthToken(w http.ResponseWriter, r *http.Request) {
+	user, err := authentication.GetUserFromRequest(r)
+	if err != nil {
+		panic(err)
+	}
+	permString := r.Header.Get("permission")
+	permission, err := models.ApiPermissionFromString(permString)
+	if err != nil {
+		http.Error(w, "Invalid permission", http.StatusBadRequest)
+		return
+	}
+	token, expiry, err := tokengeneration.Generate(user, permission)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	_, _ = w.Write([]byte("{\"key\":\"" + token + "\",\"expiry\":" + strconv.FormatInt(expiry, 10) + "}"))
+}
+
+// Handling of /changePassword
+func changePassword(w http.ResponseWriter, r *http.Request) {
+	var errMessage string
+	user, err := authentication.GetUserFromRequest(r)
+	if err != nil {
+		panic(err)
+	}
+	if !user.ResetPassword {
+		redirect(w, r, "admin")
+		return
+	}
+	err = r.ParseForm()
+	if err != nil {
+		fmt.Println("Invalid form data sent to server for /changePassword")
+		fmt.Println(err)
+		errMessage = "Invalid form data sent"
+	} else {
+		var ok bool
+		var pwHash string
+
+		pw := r.PostForm.Get("newpw")
+		csrf := r.PostForm.Get("csrf-token")
+		pwHash, ok, err = validateNewPassword(pw, user, csrf)
+		if err != nil {
+			errMessage = firstLetterUpper(err.Error())
+		}
+		if ok {
+			user.Password = pwHash
+			user.ResetPassword = false
+			database.SaveUser(user, false)
+			redirect(w, r, "admin")
+			return
+		}
+	}
+	config := configuration.Get()
+	err = templateFolder.ExecuteTemplate(w, "changepw",
+		genericView{PublicName: config.PublicName,
+			MinPasswordLength: configuration.GetEnvironment().MinLengthPassword,
+			ErrorMessage:      errMessage,
+			CustomContent:     customStaticInfo,
+			CsrfToken:         csrftoken.Generate(csrftoken.TypeLogin)})
+	helper.CheckIgnoreTimeout(err)
+}
+
+// validateNewPassword validates the new password and returns the new password hash if the password is valid.
+// If the password is not valid, it returns an error message and an empty string.
+// If the password is valid, it returns the hash as a string and true.
+func validateNewPassword(newPassword string, user models.User, userCsrfToken string) (string, bool, error) {
+	if len(newPassword) == 0 {
+		return user.Password, false, nil
+	}
+	if !csrftoken.IsValid(csrftoken.TypeLogin, userCsrfToken) {
+		return "", false, errors.New("form was not submitted completely")
+	}
+	if len(newPassword) < configuration.GetEnvironment().MinLengthPassword {
+		return "", false, errors.New("password is too short")
+	}
+	isSame, _ := configuration.VerifyPassword(newPassword, user.Password, "")
+	if isSame {
+		return "", false, errors.New("new password has to be different from the old password")
+	}
+	newPasswordHash := configuration.HashPassword(newPassword, false, "")
+	return newPasswordHash, true, nil
+}
+
+func firstLetterUpper(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	return strings.ToUpper(string(s[0])) + s[1:]
 }
 
 // Handling of /error
 func showError(w http.ResponseWriter, r *http.Request) {
-	const invalidFile = 0
-	const noCipherSupplied = 1
-	const wrongCipher = 2
 
-	errorReason := invalidFile
+	displayedError := errorHandling.Get(r)
+
 	if r.URL.Query().Has("e2e") {
-		errorReason = noCipherSupplied
+		displayedError.ErrorId = errorHandling.TypeE2ECipher
+		displayedError.IsGeneric = true
+		displayedError.CardWidth = "25rem"
 	}
-	if r.URL.Query().Has("key") {
-		errorReason = wrongCipher
-	}
-	err := templateFolder.ExecuteTemplate(w, "error", genericView{ErrorId: errorReason, PublicName: configuration.Get().PublicName})
-	helper.CheckIgnoreTimeout(err)
-}
 
-// Handling of /error-auth
-func showErrorAuth(w http.ResponseWriter, r *http.Request) {
-	err := templateFolder.ExecuteTemplate(w, "error_auth", genericView{PublicName: configuration.Get().PublicName})
-	helper.CheckIgnoreTimeout(err)
-}
-
-// Handling of /error-oauth
-func showErrorIntOAuth(w http.ResponseWriter, r *http.Request) {
-	view := oauthErrorView{PublicName: configuration.Get().PublicName}
-	view.IsAuthDenied = r.URL.Query().Get("isDenied") == "true"
-	view.ErrorProvidedName = r.URL.Query().Get("error")
-	view.ErrorProvidedMessage = r.URL.Query().Get("error_description")
-	view.ErrorGenericMessage = r.URL.Query().Get("error_generic")
-	err := templateFolder.ExecuteTemplate(w, "error_int_oauth", view)
+	err := templateFolder.ExecuteTemplate(w, "error", genericView{
+		ErrorId:           displayedError.ErrorId,
+		ErrorCardWidth:    displayedError.CardWidth,
+		IsGenericError:    displayedError.IsGeneric,
+		ErrorTitle:        displayedError.Title,
+		ErrorMessage:      displayedError.Message,
+		ErrorOauthMessage: displayedError.OAuthProviderMessage,
+		PublicName:        configuration.Get().PublicName,
+		CustomContent:     customStaticInfo})
 	helper.CheckIgnoreTimeout(err)
 }
 
 // Handling of /forgotpw
 func forgotPassword(w http.ResponseWriter, r *http.Request) {
-	err := templateFolder.ExecuteTemplate(w, "forgotpw", genericView{PublicName: configuration.Get().PublicName})
+	err := templateFolder.ExecuteTemplate(w, "forgotpw", genericView{
+		PublicName:    configuration.Get().PublicName,
+		CustomContent: customStaticInfo})
+	helper.CheckIgnoreTimeout(err)
+}
+
+// Handling of /filerequest
+func showUploadRequest(w http.ResponseWriter, r *http.Request) {
+	userId, err := authentication.GetUserFromRequest(r)
+	if err != nil {
+		panic(err)
+	}
+	view := (&AdminView{}).convertGlobalConfig(ViewFileRequests, userId)
+
+	if !view.ActiveUser.HasPermissionCreateFileRequests() {
+		redirect(w, r, "admin")
+		return
+	}
+	err = templateFolder.ExecuteTemplate(w, "uploadreq", view)
 	helper.CheckIgnoreTimeout(err)
 }
 
 // Handling of /api
-// If user is authenticated, this menu lists all uploads and enables uploading new files
+// If the user is authenticated, this menu lists all uploads and enables uploading new files
 func showApiAdmin(w http.ResponseWriter, r *http.Request) {
-	err := templateFolder.ExecuteTemplate(w, "api", (&UploadView{}).convertGlobalConfig(ViewAPI))
+	userId, err := authentication.GetUserFromRequest(r)
+	if err != nil {
+		panic(err)
+	}
+	view := (&AdminView{}).convertGlobalConfig(ViewAPI, userId)
+
+	if configuration.GetEnvironment().DisableApiMenu && !view.ActiveUser.IsAdmin() {
+		redirect(w, r, "admin")
+		return
+	}
+
+	err = templateFolder.ExecuteTemplate(w, "api", view)
 	helper.CheckIgnoreTimeout(err)
 }
 
-// Handling of /apiNew
-func newApiKey(w http.ResponseWriter, r *http.Request) {
-	api.NewKey(true)
-	redirect(w, "apiKeys")
-}
-
-// Handling of /apiDelete
-func deleteApiKey(w http.ResponseWriter, r *http.Request) {
-	keys, ok := r.URL.Query()["id"]
-	if ok {
-		api.DeleteKey(keys[0])
+// Handling of /users
+// If user is authenticated, this menu lists all users
+func showUserAdmin(w http.ResponseWriter, r *http.Request) {
+	userId, err := authentication.GetUserFromRequest(r)
+	if err != nil {
+		panic(err)
 	}
-	redirect(w, "apiKeys")
+	view := (&AdminView{}).convertGlobalConfig(ViewUsers, userId)
+	if !view.ActiveUser.HasPermissionManageUsers() || configuration.Get().Authentication.Method == models.AuthenticationDisabled {
+		redirect(w, r, "admin")
+		return
+	}
+	err = templateFolder.ExecuteTemplate(w, "users", view)
+	helper.CheckIgnoreTimeout(err)
 }
 
 // Handling of /api/
 func processApi(w http.ResponseWriter, r *http.Request) {
-	api.Process(w, r, configuration.Get().MaxMemory)
+	api.Process(w, r)
 }
 
 // Handling of /login
 // Shows a login form. If not authenticated, client needs to wait for three seconds.
 // If correct, a new session is created and the user is redirected to the admin menu
 func showLogin(w http.ResponseWriter, r *http.Request) {
-	if authentication.IsAuthenticated(w, r) {
-		redirect(w, "admin")
+	_, ok, err := authentication.IsAuthenticated(w, r)
+	if err != nil {
+		errorHandling.RedirectToErrorPage(w, r, "Unable to log in", "The following error was raised: "+err.Error(), errorHandling.WidthDefault)
 		return
 	}
-	if configuration.Get().Authentication.Method == authentication.OAuth2 {
+	if ok {
+		redirect(w, r, "admin")
+		return
+	}
+	if configuration.Get().Authentication.Method == models.AuthenticationHeader {
+		errorHandling.RedirectToErrorPage(w, r, "Unauthorised",
+			"No login information was sent from the authentication provider.", errorHandling.WidthDefault)
+		return
+	}
+	if configuration.Get().Authentication.Method == models.AuthenticationOAuth2 {
 		// If user clicked logout, force consent
 		if r.URL.Query().Has("consent") {
-			redirect(w, "oauth-login?consent=true")
+			redirect(w, r, "oauth-login?consent=true")
 		} else {
-			redirect(w, "oauth-login")
+			redirect(w, r, "oauth-login")
 		}
 		return
 	}
-	err := r.ParseForm()
+	err = r.ParseForm()
 	if err != nil {
 		fmt.Println("Invalid form data sent to server for /login")
 		fmt.Println(err)
 		return
 	}
-	user := r.Form.Get("username")
-	pw := r.Form.Get("password")
+	user := r.PostForm.Get("username")
+	pw := r.PostForm.Get("password")
+	csfr := r.PostForm.Get("csrf-token")
 	failedLogin := false
+	failedCsrf := false
 	if pw != "" && user != "" {
-		if authentication.IsCorrectUsernameAndPassword(user, pw) {
-			isOauth := configuration.Get().Authentication.Method == authentication.OAuth2
-			interval := configuration.Get().Authentication.OAuthRecheckInterval
-			sessionmanager.CreateSession(w, isOauth, interval)
-			redirect(w, "admin")
+		ip := logging.GetIpAddress(r)
+		ratelimiter.WaitOnLogin(ip)
+		retrievedUser, validCredentials, validCsfr := authentication.IsCorrectUsernameAndPassword(user, pw, csfr)
+		if validCredentials {
+			logging.LogValidLogin(user)
+			sessionmanager.CreateSession(w, false, 0, retrievedUser.Id)
+			redirect(w, r, "admin")
 			return
 		}
-		select {
-		case <-time.After(3 * time.Second):
+		if validCsfr {
+			logging.LogInvalidLogin(user, ip)
 		}
+		failedCsrf = !validCsfr
 		failedLogin = true
 	}
 	err = templateFolder.ExecuteTemplate(w, "login", LoginView{
 		IsFailedLogin: failedLogin,
+		IsFailedCsfr:  failedCsrf,
 		User:          user,
 		IsAdminView:   false,
 		PublicName:    configuration.Get().PublicName,
+		CustomContent: customStaticInfo,
+		CsrfToken:     csrftoken.Generate(csrftoken.TypeLogin),
 	})
 	helper.CheckIgnoreTimeout(err)
 }
@@ -343,23 +543,28 @@ func showLogin(w http.ResponseWriter, r *http.Request) {
 // LoginView contains variables for the login template
 type LoginView struct {
 	IsFailedLogin  bool
+	IsFailedCsfr   bool
 	IsAdminView    bool
 	IsDownloadView bool
 	User           string
 	PublicName     string
+	CsrfToken      string
+	CustomContent  customStatic
 }
 
 // Handling of /d
 // Checks if a file exists for the submitted ID
-// If it exists, a download form is shown or a password needs to be entered.
+// If it exists, a download form is shown, or a password needs to be entered.
 func showDownload(w http.ResponseWriter, r *http.Request) {
 	addNoCacheHeader(w)
-	keyId := queryUrl(w, r, "error")
+	keyId := queryUrl(w, r, "id", errorHandling.TypeFileNotFound)
 	file, ok := storage.GetFile(keyId)
-	if !ok {
-		redirect(w, "error")
+	if !ok || file.IsFileRequest() {
+		redirectOnIncorrectId(w, r, "error")
 		return
 	}
+
+	config := configuration.Get()
 
 	view := DownloadView{
 		Name:               file.Name,
@@ -367,9 +572,11 @@ func showDownload(w http.ResponseWriter, r *http.Request) {
 		Id:                 file.Id,
 		IsDownloadView:     true,
 		EndToEndEncryption: file.Encryption.IsEndToEndEncrypted,
-		PublicName:         configuration.Get().PublicName,
+		PublicName:         config.PublicName,
+		BaseUrl:            config.ServerUrl,
 		IsFailedLogin:      false,
 		UsesHttps:          configuration.UsesHttps(),
+		CustomContent:      customStaticInfo,
 	}
 
 	if file.RequiresClientDecryption() {
@@ -381,117 +588,69 @@ func showDownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if file.PasswordHash != "" {
+	if file.PasswordHash != "" && !isValidPwCookie(r, file) {
 		_ = r.ParseForm()
-		enteredPassword := r.Form.Get("password")
-		if configuration.HashPassword(enteredPassword, true) != file.PasswordHash && !isValidPwCookie(r, file) {
-			if enteredPassword != "" {
-				view.IsFailedLogin = true
-				select {
-				case <-time.After(1 * time.Second):
-				}
-			}
+		enteredPassword := r.PostForm.Get("password")
+		if enteredPassword == "" {
 			view.IsPasswordView = true
 			err := templateFolder.ExecuteTemplate(w, "download_password", view)
 			helper.CheckIgnoreTimeout(err)
 			return
 		}
-		if !isValidPwCookie(r, file) {
+
+		ip := logging.GetIpAddress(r)
+		ratelimiter.WaitOnDownloadPassword(ip)
+
+		isValid, isLegacy := configuration.VerifyPassword(enteredPassword, file.PasswordHash, configuration.Get().Authentication.SaltFiles)
+		if isValid {
+			// Migrate legacy passwords to the new format
+			// Will be removed in the future
+			if isLegacy {
+				file.PasswordHash = configuration.HashPassword(enteredPassword, false, "")
+				database.SaveMetaData(file)
+			}
 			writeFilePwCookie(w, file)
 			// redirect so that there is no post data to be resent if user refreshes page
-			redirect(w, "d?id="+file.Id)
+			redirect(w, r, "d?id="+file.Id)
 			return
 		}
+		view.IsFailedLogin = true
+		view.IsPasswordView = true
+		err := templateFolder.ExecuteTemplate(w, "download_password", view)
+		helper.CheckIgnoreTimeout(err)
+		return
 	}
+
 	err := templateFolder.ExecuteTemplate(w, "download", view)
 	helper.CheckIgnoreTimeout(err)
 }
 
-// Handling of /hotlink/
+// Handling of /h/ and /hotlink/
 // Hotlinks an image or returns a static error image if image has expired
 func showHotlink(w http.ResponseWriter, r *http.Request) {
-	addNoCacheHeader(w)
 	hotlinkId := strings.Replace(r.URL.Path, "/hotlink/", "", 1)
+	hotlinkId = strings.Replace(hotlinkId, "/h/", "", 1)
+	addNoCacheHeader(w)
 	file, ok := storage.GetFileByHotlink(hotlinkId)
-	if !ok {
+	if !ok || file.IsFileRequest() {
 		w.Header().Set("Content-Type", "image/svg+xml")
 		_, _ = w.Write(imageExpiredPicture)
 		return
 	}
-	storage.ServeFile(file, w, r, false)
-}
-
-// Handling of /e2eInfo
-// User needs to be admin. Receives or stores end2end encryption info
-func e2eInfo(w http.ResponseWriter, r *http.Request) {
-	action, ok := r.URL.Query()["action"]
-	if !ok || len(action) < 1 {
-		responseError(w, errors.New("invalid action specified"))
+	validFile := storage.ServeFile(file, w, r, false, true, false, true)
+	if !validFile {
+		// Only called if the file has already expired during the expiry check of storage.ServeFile()
+		w.Header().Set("Content-Type", "image/svg+xml")
+		_, _ = w.Write(imageExpiredPicture)
 		return
 	}
-	switch action[0] {
-	case "get":
-		getE2eInfo(w)
-	case "store":
-		storeE2eInfo(w, r)
-	default:
-		responseError(w, errors.New("invalid action specified"))
-	}
-}
-
-func storeE2eInfo(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseForm()
-	if err != nil {
-		responseError(w, err)
-		return
-	}
-	uploadedInfoBase64 := r.Form.Get("info")
-	if uploadedInfoBase64 == "" {
-		responseError(w, errors.New("empty info sent"))
-		return
-	}
-	uploadedInfo, err := base64.StdEncoding.DecodeString(uploadedInfoBase64)
-	if err != nil {
-		responseError(w, err)
-		return
-	}
-	var info models.E2EInfoEncrypted
-	err = json.Unmarshal(uploadedInfo, &info)
-	if err != nil {
-		responseError(w, err)
-		return
-	}
-	database.SaveEnd2EndInfo(info)
-	_, _ = w.Write([]byte("\"result\":\"OK\""))
-}
-
-func getE2eInfo(w http.ResponseWriter) {
-	info := database.GetEnd2EndInfo()
-	bytesE2e, err := json.Marshal(info)
-	helper.Check(err)
-	_, _ = w.Write(bytesE2e)
-}
-
-// Handling of /delete
-// User needs to be admin. Deletes the requested file
-func deleteFile(w http.ResponseWriter, r *http.Request) {
-	keyId := queryUrl(w, r, "admin")
-	if keyId == "" {
-		return
-	}
-	storage.DeleteFile(keyId, true)
-	redirect(w, "admin")
 }
 
 // Checks if a file is associated with the GET parameter from the current URL
-// Stops for 500ms to limit brute forcing if invalid key and redirects to redirectUrl
-func queryUrl(w http.ResponseWriter, r *http.Request, redirectUrl string) string {
-	keys, ok := r.URL.Query()["id"]
-	if !ok || len(keys[0]) < configuration.Get().LengthId {
-		select {
-		case <-time.After(500 * time.Millisecond):
-		}
-		redirect(w, redirectUrl)
+func queryUrl(w http.ResponseWriter, r *http.Request, keyword string, errorType int) string {
+	keys, ok := r.URL.Query()[keyword]
+	if !ok || len(keys[0]) < environment.MinLengthId {
+		errorHandling.RedirectGenericErrorPage(w, r, errorType)
 		return ""
 	}
 	return keys[0]
@@ -500,31 +659,62 @@ func queryUrl(w http.ResponseWriter, r *http.Request, redirectUrl string) string
 // Handling of /admin
 // If user is authenticated, this menu lists all uploads and enables uploading new files
 func showAdminMenu(w http.ResponseWriter, r *http.Request) {
-	if configuration.Get().Encryption.Level == encryption.EndToEndEncryption {
-		e2einfo := database.GetEnd2EndInfo()
+	user, err := authentication.GetUserFromRequest(r)
+	if err != nil {
+		panic(err)
+	}
+
+	config := configuration.Get()
+	if config.Encryption.Level == encryption.EndToEndEncryption {
+		e2einfo := database.GetEnd2EndInfo(user.Id)
 		if !e2einfo.HasBeenSetUp() {
-			redirect(w, "e2eSetup")
+			redirect(w, r, "e2eSetup")
 			return
 		}
 	}
-	err := templateFolder.ExecuteTemplate(w, "admin", (&UploadView{}).convertGlobalConfig(ViewMain))
+
+	view := (&AdminView{}).convertGlobalConfig(ViewMain, user)
+	if len(configuration.GetEnvironment().ActiveDeprecations) > 0 {
+		if user.IsSuperAdmin() {
+			view.ShowDeprecationNotice = true
+		}
+	}
+
+	err = templateFolder.ExecuteTemplate(w, "admin", view)
 	helper.CheckIgnoreTimeout(err)
 }
 
 // Handling of /logs
 // If user is authenticated, this menu shows the stored logs
 func showLogs(w http.ResponseWriter, r *http.Request) {
-	err := templateFolder.ExecuteTemplate(w, "logs", (&UploadView{}).convertGlobalConfig(ViewLogs))
+	user, err := authentication.GetUserFromRequest(r)
+	if err != nil {
+		panic(err)
+	}
+	view := (&AdminView{}).convertGlobalConfig(ViewLogs, user)
+	if !view.ActiveUser.HasPermissionManageLogs() {
+		redirect(w, r, "admin")
+		return
+	}
+	err = templateFolder.ExecuteTemplate(w, "logs", view)
 	helper.CheckIgnoreTimeout(err)
 }
 
 func showE2ESetup(w http.ResponseWriter, r *http.Request) {
 	if configuration.Get().Encryption.Level != encryption.EndToEndEncryption {
-		redirect(w, "admin")
+		redirect(w, r, "admin")
 		return
 	}
-	e2einfo := database.GetEnd2EndInfo()
-	err := templateFolder.ExecuteTemplate(w, "e2esetup", e2ESetupView{HasBeenSetup: e2einfo.HasBeenSetUp(), PublicName: configuration.Get().PublicName})
+
+	user, err := authentication.GetUserFromRequest(r)
+	if err != nil {
+		panic(err)
+	}
+	e2einfo := database.GetEnd2EndInfo(user.Id)
+	err = templateFolder.ExecuteTemplate(w, "e2esetup", e2ESetupView{
+		HasBeenSetup:  e2einfo.HasBeenSetUp(),
+		PublicName:    configuration.Get().PublicName,
+		CustomContent: customStaticInfo})
 	helper.CheckIgnoreTimeout(err)
 }
 
@@ -535,6 +725,7 @@ type DownloadView struct {
 	Id                   string
 	Cipher               string
 	PublicName           string
+	BaseUrl              string
 	IsFailedLogin        bool
 	IsAdminView          bool
 	IsDownloadView       bool
@@ -542,6 +733,7 @@ type DownloadView struct {
 	ClientSideDecryption bool
 	EndToEndEncryption   bool
 	UsesHttps            bool
+	CustomContent        customStatic
 }
 
 type e2ESetupView struct {
@@ -549,105 +741,259 @@ type e2ESetupView struct {
 	IsDownloadView bool
 	HasBeenSetup   bool
 	PublicName     string
+	CustomContent  customStatic
 }
 
-// UploadView contains parameters for the admin menu template
-type UploadView struct {
-	Items                    []models.FileApiOutput
-	ApiKeys                  []models.ApiKey
-	Url                      string
-	HotlinkUrl               string
-	GenericHotlinkUrl        string
-	DefaultPassword          string
-	Logs                     string
-	PublicName               string
-	IsAdminView              bool
-	IsDownloadView           bool
-	IsApiView                bool
-	IsLogoutAvailable        bool
-	DefaultUnlimitedDownload bool
-	DefaultUnlimitedTime     bool
-	EndToEndEncryption       bool
-	MaxFileSize              int
-	DefaultDownloads         int
-	DefaultExpiry            int
-	ActiveView               int
-	TimeNow                  int64
+// AdminView contains parameters for all admin-related pages
+type AdminView struct {
+	Items                 []models.FileApiOutput
+	ApiKeys               []models.ApiKey
+	Users                 []userInfo
+	FileRequests          []models.FileRequest
+	ActiveUser            models.User
+	UserMap               map[int]*models.User
+	ServerUrl             string
+	PublicName            string
+	IsAdminView           bool
+	IsDownloadView        bool
+	IsApiView             bool
+	IsLogoutAvailable     bool
+	IsUserTabAvailable    bool
+	EndToEndEncryption    bool
+	IncludeFilename       bool
+	IsInternalAuth        bool
+	ShowApiMenu           bool
+	ShowDeprecationNotice bool
+	MaxFileSize           int
+	ActiveView            int
+	ChunkSize             int
+	MaxParallelUploads    int
+	MinLengthPassword     int
+	FileRequestMaxFiles   int
+	FileRequestMaxSize    int
+	TotalFiles            int
+	CpuLoad               int
+	MemoryUsagePercent    int
+	DiskUsagePercent      int
+	DataServed            int64
+	Uptime                int64
+	TimeNow               int64
+	TrafficSince          int64
+	MemoryUsage           uint64
+	MemoryTotal           uint64
+	DiskUsage             uint64
+	DiskTotal             uint64
+	TotalTraffic          uint64
+
+	CustomContent customStatic
 }
 
-// ViewMain is the identifier for the main menu
-const ViewMain = 0
+// getUserMap needs to return the map with pointers; otherwise template cannot call
+// functions associated with it
+func getUserMap() map[int]*models.User {
+	result := make(map[int]*models.User)
+	users := database.GetAllUsers()
+	for _, user := range users {
+		result[user.Id] = &user
+	}
+	return result
+}
 
-// ViewLogs is the identifier for the log viewer menu
-const ViewLogs = 1
+const (
+	// ViewMain is the identifier for the main menu
+	ViewMain = iota
+	// ViewLogs is the identifier for the log viewer menu
+	ViewLogs
+	// ViewAPI is the identifier for the API menu
+	ViewAPI
+	// ViewUsers is the identifier for the user management menu
+	ViewUsers
+	// ViewFileRequests is the identifier for the file request menu
+	ViewFileRequests
+)
 
-// ViewAPI is the identifier for the API menu
-const ViewAPI = 2
-
-// Converts the globalConfig variable to an UploadView struct to pass the infos to
+// Converts the globalConfig variable to an AdminView struct to pass the infos to
 // the admin template
-func (u *UploadView) convertGlobalConfig(view int) *UploadView {
-	var result []models.FileApiOutput
-	var resultApi []models.ApiKey
+func (u *AdminView) convertGlobalConfig(view int, user models.User) *AdminView {
+	var metaDataList []models.FileApiOutput
+	var apiKeyList []models.ApiKey
+
+	config := configuration.Get()
+	u.IsInternalAuth = config.Authentication.Method == models.AuthenticationInternal
+	u.ActiveUser = user
+	u.UserMap = getUserMap()
+	u.CustomContent = customStaticInfo
 	switch view {
 	case ViewMain:
 		for _, element := range database.GetAllMetadata() {
-			fileInfo, err := element.ToFileApiOutput()
-			helper.Check(err)
-			result = append(result, fileInfo)
-		}
-		sort.Slice(result[:], func(i, j int) bool {
-			if result[i].ExpireAt == result[j].ExpireAt {
-				return result[i].Id > result[j].Id
+			if element.UserId != user.Id && !user.HasPermissionListOtherUploads() {
+				continue
 			}
-			return result[i].ExpireAt > result[j].ExpireAt
-		})
+			fileInfo, err := element.ToFileApiOutput(config.ServerUrl, config.IncludeFilename)
+			helper.Check(err)
+			metaDataList = append(metaDataList, fileInfo)
+		}
+		metaDataList = sortMetaDataApi(metaDataList)
 	case ViewAPI:
-		for _, element := range database.GetAllApiKeys() {
-			if element.LastUsed == 0 {
-				element.LastUsedString = "Never"
-			} else {
-				element.LastUsedString = time.Unix(element.LastUsed, 0).Format("2006-01-02 15:04:05")
+		for _, apiKey := range database.GetAllApiKeys() {
+			// Double-checking if the owner of the API key exists
+			// If the user was manually deleted from the database, this could lead to a crash
+			// in the API view
+			_, ok := u.UserMap[apiKey.UserId]
+			if !ok {
+				continue
 			}
-			resultApi = append(resultApi, element)
+			if !apiKey.IsSystemKey && !apiKey.IsUploadRequestKey() {
+				if apiKey.UserId == user.Id || user.HasPermissionManageApi() {
+					apiKeyList = append(apiKeyList, apiKey)
+				}
+			}
 		}
-		sort.Slice(resultApi[:], func(i, j int) bool {
-			if resultApi[i].LastUsed == resultApi[j].LastUsed {
-				return resultApi[i].Id < resultApi[j].Id
-			}
-			return resultApi[i].LastUsed > resultApi[j].LastUsed
-		})
+		apiKeyList = sortApiKeys(apiKeyList)
 	case ViewLogs:
-		if helper.FileExists(logging.GetLogPath()) {
-			content, err := os.ReadFile(logging.GetLogPath())
-			helper.Check(err)
-			u.Logs = string(content)
-		} else {
-			u.Logs = "Warning: Log file not found!"
+		u.TotalFiles = serverstats.GetTotalFiles()
+		u.Uptime = serverstats.GetUptime()
+		u.TotalTraffic, u.TrafficSince = serverstats.GetCurrentTraffic()
+		_, u.MemoryUsage, u.MemoryTotal, u.MemoryUsagePercent = serverstats.GetMemoryInfo()
+		_, u.DiskUsage, u.DiskTotal, u.DiskUsagePercent = serverstats.GetDiskInfo()
+		u.CpuLoad = serverstats.GetCpuUsage()
+	case ViewUsers:
+		uploadCounts := storage.GetUploadCounts()
+		u.Users = make([]userInfo, 0)
+		for _, userEntry := range database.GetAllUsers() {
+			userWithUploads := userInfo{
+				UploadCount: uploadCounts[userEntry.Id],
+				User:        userEntry,
+			}
+			// Otherwise the user is not shown as online, if /users is opened as first page
+			if userEntry.Id == user.Id {
+				userWithUploads.User.LastOnline = time.Now().Unix()
+			}
+			u.Users = append(u.Users, userWithUploads)
+		}
+	case ViewFileRequests:
+		for _, fileRequest := range filerequest.GetAll() {
+			// Double-checking if the owner of the file request exists
+			// If the user was manually deleted from the database, this could lead to a crash
+			// in the file request view
+			_, ok := u.UserMap[fileRequest.UserId]
+			if !ok {
+				continue
+			}
+			if fileRequest.UserId != user.Id && !user.HasPermissionListOtherUploads() {
+				continue
+			}
+			fileRequest.Files = sortMetaData(fileRequest.Files)
+			u.FileRequests = append(u.FileRequests, fileRequest)
+			if !user.IsAdmin() {
+				u.FileRequestMaxFiles = configuration.GetEnvironment().MaxFilesGuestUpload
+				u.FileRequestMaxSize = configuration.GetEnvironment().MaxSizeGuestUploadMb
+			}
 		}
 	}
 
-	config := configuration.Get()
+	showApiMenu := true
+	if configuration.GetEnvironment().DisableApiMenu {
+		showApiMenu = user.IsAdmin()
+	}
 
-	u.Url = config.ServerUrl + "d?id="
-	u.HotlinkUrl = config.ServerUrl + "hotlink/"
-	u.GenericHotlinkUrl = config.ServerUrl + "downloadFile?id="
-	u.Items = result
+	u.ServerUrl = config.ServerUrl
+	u.Items = metaDataList
 	u.PublicName = config.PublicName
-	u.ApiKeys = resultApi
+	u.ApiKeys = apiKeyList
 	u.TimeNow = time.Now().Unix()
 	u.IsAdminView = true
 	u.ActiveView = view
 	u.MaxFileSize = config.MaxFileSizeMB
 	u.IsLogoutAvailable = authentication.IsLogoutAvailable()
-	defaultValues := database.GetUploadDefaults()
-	u.DefaultDownloads = defaultValues.Downloads
-	u.DefaultExpiry = defaultValues.TimeExpiry
-	u.DefaultPassword = defaultValues.Password
-	u.DefaultUnlimitedDownload = defaultValues.UnlimitedDownload
-	u.DefaultUnlimitedTime = defaultValues.UnlimitedTime
+	u.ShowApiMenu = showApiMenu
+	u.IsUserTabAvailable = config.Authentication.Method != models.AuthenticationDisabled
 	u.EndToEndEncryption = config.Encryption.Level == encryption.EndToEndEncryption
+	u.MaxParallelUploads = config.MaxParallelUploads
+	u.ChunkSize = config.ChunkSize
+	u.IncludeFilename = config.IncludeFilename
 	return u
+}
+
+// sortMetaDataApi arranges the provided array so that Fies are sorted by the most recent upload first and if that is equal,
+// then by most time remaining first. If that is equal, then sort by ID.
+func sortMetaDataApi(input []models.FileApiOutput) []models.FileApiOutput {
+	sort.Slice(input[:], func(i, j int) bool {
+		if input[i].UploadDate != input[j].UploadDate {
+			return input[i].UploadDate > input[j].UploadDate
+		}
+		if input[i].ExpireAt != input[j].ExpireAt {
+			return input[i].ExpireAt > input[j].ExpireAt
+		}
+		return input[i].Id > input[j].Id
+	})
+	return input
+}
+
+// sortMetaData arranges the provided array so that Fies are sorted by the most recent upload first then sort by ID.
+// Currently only used for the files of File Requests, all others use sortMetaDataApi
+func sortMetaData(input []models.File) []models.File {
+	sort.Slice(input[:], func(i, j int) bool {
+		if input[i].UploadDate != input[j].UploadDate {
+			return input[i].UploadDate > input[j].UploadDate
+		}
+		return input[i].Id > input[j].Id
+	})
+	return input
+}
+
+// sortApiKeys arranges the provided array so that API keys are sorted by most recent usage first and if that is equal
+// then by ID
+func sortApiKeys(input []models.ApiKey) []models.ApiKey {
+	sort.Slice(input[:], func(i, j int) bool {
+		if input[i].LastUsed != input[j].LastUsed {
+			return input[i].LastUsed > input[j].LastUsed
+		}
+		return input[i].Id < input[j].Id
+	})
+	return input
+}
+
+type userInfo struct {
+	UploadCount int
+	User        models.User
+}
+
+// Handling of /publicUpload
+func showPublicUpload(w http.ResponseWriter, r *http.Request) {
+	addNoCacheHeader(w)
+	fileRequestId := queryUrl(w, r, "id", errorHandling.TypeInvalidFileRequest)
+	request, ok := filerequest.Get(fileRequestId)
+	if !ok {
+		errorHandling.RedirectGenericErrorPage(w, r, errorHandling.TypeInvalidFileRequest)
+		return
+	}
+	if !request.IsUnlimitedTime() && request.Expiry < time.Now().Unix() {
+		errorHandling.RedirectGenericErrorPage(w, r, errorHandling.TypeInvalidFileRequest)
+		return
+	}
+	if !request.IsUnlimitedFiles() && request.UploadedFiles >= request.MaxFiles {
+		errorHandling.RedirectGenericErrorPage(w, r, errorHandling.TypeInvalidFileRequest)
+		return
+	}
+	apiKey := queryUrl(w, r, "key", errorHandling.TypeInvalidFileRequest)
+	if subtle.ConstantTimeCompare([]byte(request.ApiKey), []byte(apiKey)) != 1 {
+		errorHandling.RedirectGenericErrorPage(w, r, errorHandling.TypeInvalidFileRequest)
+		return
+	}
+
+	config := configuration.Get()
+
+	view := publicUploadView{
+		PublicName:    config.PublicName,
+		ChunkSize:     config.ChunkSize,
+		MaxServerSize: config.MaxFileSizeMB,
+		FileRequest:   &request,
+		CustomContent: customStaticInfo,
+	}
+
+	err := templateFolder.ExecuteTemplate(w, "publicUpload", view)
+	helper.CheckIgnoreTimeout(err)
 }
 
 // Handling of /uploadChunk
@@ -657,17 +1003,10 @@ func uploadChunk(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 	if r.ContentLength > maxUpload {
 		responseError(w, storage.ErrorFileTooLarge)
+		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
-	err := fileupload.ProcessNewChunk(w, r, false)
-	responseError(w, err)
-}
-
-// Handling of /uploadComplete
-// If the user is authenticated, this parses the uploaded chunk and stores it
-func uploadComplete(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-	err := fileupload.CompleteChunk(w, r, false)
+	_, err := fileupload.ProcessNewChunk(w, r, false, "", maxUpload)
 	responseError(w, err)
 }
 
@@ -676,79 +1015,182 @@ func responseError(w http.ResponseWriter, err error) {
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(w, "{\"Result\":\"error\",\"ErrorMessage\":\""+err.Error()+"\"}")
-		log.Println(err)
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			log.Println(err)
+		}
 	}
 }
 
+// Handling of /dh/?/?
+// Hotlinks a file and has the filename in the URL
+func downloadFileWithNameInUrl(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	serveFile(id, false, w, r)
+}
+
+// Handling of /downloadFile
 // Outputs the file to the user and reduces the download remaining count for the file
 func downloadFile(w http.ResponseWriter, r *http.Request) {
+	id := queryUrl(w, r, "id", errorHandling.TypeFileNotFound)
+	serveFile(id, true, w, r)
+}
+
+// Handling of /downloadPresigned
+// Outputs the file to the user and reduces the download remaining count for the file, if requested
+func downloadPresigned(w http.ResponseWriter, r *http.Request) {
 	addNoCacheHeader(w)
-	keyId := queryUrl(w, r, "error")
-	savedFile, ok := storage.GetFile(keyId)
+	presignKey, ok := r.URL.Query()["key"]
 	if !ok {
-		redirect(w, "error")
+		responseError(w, storage.ErrorInvalidPresign)
+		return
+	}
+	presignedUrl, ok := presign.Get(presignKey[0])
+	if !ok {
+		responseError(w, storage.ErrorInvalidPresign)
+		return
+	}
+	files := make([]models.File, 0)
+	for _, file := range presignedUrl.FileIds {
+		storedFile, ok := storage.GetFile(file)
+		if !ok {
+			responseError(w, storage.ErrorFileNotFound)
+			return
+		}
+		files = append(files, storedFile)
+	}
+	presign.Delete(presignedUrl.Id)
+
+	if len(files) == 1 {
+		file := files[0]
+		forceDecryption := file.Encryption.IsEncrypted && !file.Encryption.IsEndToEndEncrypted
+		storage.ServeFile(file, w, r, true, false, forceDecryption, false)
+		return
+	}
+	storage.ServeFilesAsZip(files, presignedUrl.Filename, w, r)
+}
+
+func serveFile(id string, isRootUrl bool, w http.ResponseWriter, r *http.Request) {
+	addNoCacheHeader(w)
+	savedFile, ok := storage.GetFile(id)
+
+	if !ok || savedFile.IsFileRequest() {
+		if isRootUrl {
+			redirectOnIncorrectId(w, r, "error")
+		} else {
+			redirectOnIncorrectId(w, r, "../../error")
+		}
 		return
 	}
 	if savedFile.PasswordHash != "" {
 		if !(isValidPwCookie(r, savedFile)) {
-			redirect(w, "d?id="+savedFile.Id)
+			if isRootUrl {
+				redirect(w, r, "d?id="+savedFile.Id)
+			} else {
+				redirect(w, r, "../../d?id="+savedFile.Id)
+			}
 			return
 		}
 	}
-	storage.ServeFile(savedFile, w, r, true)
+	validFile := storage.ServeFile(savedFile, w, r, true, true, false, true)
+	if !validFile {
+		// Only called if the file has already expired during the expiry check of storage.ServeFile()
+		if isRootUrl {
+			redirectOnIncorrectId(w, r, "error")
+		} else {
+			redirectOnIncorrectId(w, r, "../../error")
+		}
+		return
+	}
 }
 
-func requireLogin(next http.HandlerFunc, isUpload bool) http.HandlerFunc {
+func requireLogin(next http.HandlerFunc, isUiCall, isPwChangeView bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		addNoCacheHeader(w)
-		if authentication.IsAuthenticated(w, r) {
+		user, isLoggedIn, err := authentication.IsAuthenticated(w, r)
+		if err != nil {
+			errorHandling.RedirectToErrorPage(w, r, "Unable to log in", "The following error was raised: "+err.Error(), errorHandling.WidthDefault)
+			return
+		}
+		if isLoggedIn {
+			if user.ResetPassword && isUiCall && configuration.Get().Authentication.Method == models.AuthenticationInternal {
+				if !isPwChangeView {
+					redirect(w, r, "changePassword")
+					return
+				}
+			}
+			r = authentication.SetUserInRequest(r, user)
 			next.ServeHTTP(w, r)
 			return
 		}
-		if isUpload {
+		if !isUiCall {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 			_, _ = io.WriteString(w, "{\"Result\":\"error\",\"ErrorMessage\":\"Not authenticated\"}")
 			return
 		}
-		redirect(w, "login")
+		redirect(w, r, "login")
 	}
+}
+
+type adminButtonContext struct {
+	CurrentFile models.FileApiOutput
+	ActiveUser  *models.User
+}
+
+// Used internally in templates to create buttons with user context
+func newAdminButtonContext(file models.FileApiOutput, user models.User) adminButtonContext {
+	return adminButtonContext{CurrentFile: file, ActiveUser: &user}
 }
 
 // Write a cookie if the user has entered a correct password for a password-protected file
 func writeFilePwCookie(w http.ResponseWriter, file models.File) {
 	http.SetCookie(w, &http.Cookie{
-		Name:    "p" + file.Id,
-		Value:   file.PasswordHash,
-		Expires: time.Now().Add(5 * time.Minute),
+		Name:     "p" + file.Id,
+		Value:    downloadPasswordToken.Generate(file.Id),
+		Expires:  time.Now().Add(5 * time.Minute),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
 	})
 }
 
-// Checks if a cookie contains the correct password hash for a password-protected file
-// If incorrect, a 3-second delay is introduced unless the cookie was empty.
+// Checks if a cookie contains the correct token for a password-protected file
 func isValidPwCookie(r *http.Request, file models.File) bool {
 	cookie, err := r.Cookie("p" + file.Id)
-	if err == nil {
-		if cookie.Value == file.PasswordHash {
-			return true
-		}
-		select {
-		case <-time.After(3 * time.Second):
-		}
+	if err != nil {
+		return false
 	}
-	return false
+	return downloadPasswordToken.IsValid(cookie.Value, file.Id)
 }
 
 // Adds a header to disable external caching
 func addNoCacheHeader(w http.ResponseWriter) {
-	w.Header().Set("cache-control", "no-store")
+	w.Header().Set("cdn-cache-control", "no-store, no-cache")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store, no-cache")
+	w.Header().Set("cache-control", "no-store, no-cache")
+	w.Header().Set("Pragma", "no-cache")
+}
+
+func addCacheHeader(w http.ResponseWriter) {
+	w.Header().Set("cdn-cache-control", "public, max-age=36000")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "public, max-age=36000")
+	w.Header().Set("cache-control", "public, max-age=36000")
 }
 
 // A view containing parameters for a generic template
 type genericView struct {
-	IsAdminView    bool
-	IsDownloadView bool
-	PublicName     string
-	RedirectUrl    string
-	ErrorId        int
+	IsAdminView       bool
+	IsDownloadView    bool
+	IsGenericError    bool
+	PublicName        string
+	RedirectUrl       string
+	ErrorTitle        string
+	ErrorMessage      string
+	ErrorOauthMessage string
+	CsrfToken         string
+	ErrorCardWidth    string
+	ErrorId           int
+	MinPasswordLength int
+	CustomContent     customStatic
 }
 
 // A view containing parameters for an oauth error
@@ -760,4 +1202,16 @@ type oauthErrorView struct {
 	ErrorGenericMessage  string
 	ErrorProvidedName    string
 	ErrorProvidedMessage string
+	CustomContent        customStatic
+}
+
+// A view containing parameters for the public upload page
+type publicUploadView struct {
+	IsAdminView    bool
+	IsDownloadView bool
+	PublicName     string
+	ChunkSize      int
+	MaxServerSize  int
+	CustomContent  customStatic
+	FileRequest    *models.FileRequest
 }

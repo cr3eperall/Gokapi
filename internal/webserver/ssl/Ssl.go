@@ -10,8 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"github.com/forceu/gokapi/internal/environment"
-	"github.com/forceu/gokapi/internal/helper"
 	"io"
 	"math"
 	"math/big"
@@ -20,13 +18,20 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/forceu/gokapi/internal/environment"
+	"github.com/forceu/gokapi/internal/helper"
 )
 
 var configDir string
 
 func isCertificatePresent() bool {
 	certificate, key := GetCertificateLocations()
-	return helper.FileExists(certificate) && helper.FileExists(key)
+	existsCert, err := helper.FileExists(certificate)
+	helper.Check(err)
+	existsKey, err := helper.FileExists(key)
+	helper.Check(err)
+	return existsCert && existsKey
 }
 
 // GetCertificateLocations returns the filepath of the public certificate and private key
@@ -92,17 +97,18 @@ func generateCertificates(externalUrl string) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	helper.Check(err)
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
 			Organization: []string{"Gokapi"},
 		},
-		NotBefore: time.Now(),
+		NotBefore: time.Now().Add(-5 * time.Minute),
 		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
 
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
+	template.SerialNumber, err = rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	helper.Check(err)
 
 	host := getDomain(externalUrl)
 	ip := net.ParseIP(host)

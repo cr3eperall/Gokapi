@@ -1,5 +1,4 @@
-{{define "login"}}
-{{ template "header" . }} 
+{{define "login"}}{{ template "header" . }} 
       <div class="row">
         <div class="col">
 		<div id="container" class="card" style="width: 20em">
@@ -8,16 +7,36 @@
 		    <br>
 		    <p class="card-text">
 			<form method="post" action="./login" id="form" name="form" onSubmit="submitForm()">
-				<input type="text" placeholder="Username" value="{{.User}}" id="username">
+			    <div class="mb-3">
+				<input type="text" class="form-control mx-auto" style="max-width: 300px;" 
+				       autocomplete="username" placeholder="Username" value="{{.User}}" id="username">
 				<input type="hidden" id="uname_hidden" name="username">
-				<br><br>
-				<input type="password"  placeholder="Password" id="password">
+			    </div>
+
+			    <div class="mb-3">
+				<input type="password" class="form-control mx-auto" style="max-width: 300px;" 
+				       autocomplete="current-password" placeholder="Password" id="password">
 				<input type="hidden" id="pw_hidden" name="password">
-				<br><br>
+			    </div>
+
 {{ if .IsFailedLogin }}
-				<span style="color:red"> Incorrect username or password!</span><br><br>
+	{{ if .IsFailedCsfr }}
+			    <div class="mb-3">
+				<span class="text-danger">The login page was open too long and expired. Please try again.</span>
+			    </div>
+	{{ else }}
+			    <div class="mb-3">
+				<span class="text-danger">Incorrect username or password!</span>
+			    </div>
+	{{ end }}
 {{ end }}
-				<button type="submit"  id="submitbutton" class="btn btn-light">Login</button>
+
+			    <div class="mt-4">
+				<button type="submit" id="submitbutton" class="btn btn-primary w-100 mx-auto" style="max-width: 300px;">
+				    Login
+				</button>
+			    </div>
+				<input type="hidden" id="csrf-token" name="csrf-token" value="{{.CsrfToken}}">
 			</form>
 			<br><br>
 			<a href="./forgotpw">Forgot password</a></p>
@@ -35,5 +54,7 @@ function submitForm(){
 	return true;
 }
 </script>
+{{ template "pagename" "Login"}}
+{{ template "customjs" .}}
 {{ template "footer" }}
 {{end}}

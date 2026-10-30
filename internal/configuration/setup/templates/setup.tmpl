@@ -2,11 +2,11 @@
 <html lang="en">
 	<head>
 		<title>Gokapi Setup</title>
-		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1.0">
-		<link href="./bootstrap/bootstrap.css" rel="stylesheet" />
-		<link href="./src/bootstrap-wizard.css" rel="stylesheet" />
-		<link href="./chosen/chosen.css" rel="stylesheet" />
+		<link href="./bootstrap/bootstrap.css" rel="stylesheet">
+		<link href="./src/bootstrap-wizard.css" rel="stylesheet">
+		<link href="./chosen/chosen.css" rel="stylesheet">
 		<style>
 			.wizard-modal p {
 				margin: 0 0 10px;
@@ -57,6 +57,7 @@
 			    #label_ousers, #label_ogroups {
 			      margin-right: 10px;
 			    }
+			    
 
 		</style>
 		<!-- HTML5 Shim and Respond.js IE8 support of HTML5 elements and media queries -->
@@ -89,14 +90,66 @@
 						You can now change the Gokapi configuration. For further information please refer to the <a href="https://gokapi.readthedocs.io/en/stable/" title="Gokapi Documentation" target="_blank" rel="noopener noreferrer">documentation</a>.
 					</p>
 {{ end }}
+					<br>
+{{ if .IsDataNotMounted }}
+					<p>
+					<span style="color:#FF0000;"><b>Warning:</b> It appears that your <code>/app/data</code> directory has not been mounted as a volume. This will result in complete data loss once you update or rebuild this container!</span>
+					</p>
+{{ end }}
+{{ if .IsConfigNotMounted }}
+					<p>
+					<span style="color:#FF0000;"><b>Warning:</b> It appears that your <code>/app/config</code> directory has not been mounted as a volume. This will result in complete data loss once you update or rebuild this container!</span>
+					</p>
+{{ end }}
 
 				</div>
 			</div>
+			<!-- Step 1 DB Location -->
+			<div class="wizard-card wizard-card-overlay" data-cardname="dblocation">
+				<h3 style="display:none">Database</h3>
+
+				<div class="wizard-input-section">
+					<div class="form-group">
+					
+{{ if not .IsInitialSetup }}
+				<p>
+					<span style="color:red"><b>Warning:</b> When changing database parameters, ensure you first migrate the database to the new location using <code>gokapi migrate-database</code> before finalising the setup.</span>
+				</p><br>
+{{ end }}
+
+							  <label for="dbtype_sel">Type of database</label>
+						<select name="dbtype_sel" id="dbtype_sel"  style="width:350px;" class="select form-control"  onChange="dbChanged()">	
+								<option value="0" selected>SQLite</option>
+								<option value="1">Redis</option>
+
+						</select><br>
+						<div id="divsqlite">
+							<label for="sqlite_location">Database location:</label>
+							<input type="text" class="form-control" id="sqlite_location" name="sqlite_location" value="./data/gokapi.sqlite" placeholder="Database location" required><br>
+						</div>
+						<div id="divredis" style="display: none;">
+							<label for="redis_location">Database host:</label>
+							<input type="text" class="form-control" id="redis_location" name="redis_location" value="127.0.0.1:6379" placeholder="Database host" required><br>
+							<label for="redis_prefix">Key prefix:</label>
+							<input type="text" class="form-control" id="redis_prefix" name="redis_prefix" value="gokapi_" placeholder="(optional)"><br>				
+							<label for="redis_user">Username:</label>
+							<input type="text" class="form-control" id="redis_user" name="redis_user" value="" placeholder="(optional)"><br>				
+							<label for="redis_password">Password (stored in plain text):</label>
+							<input type="text" class="form-control" id="redis_password" name="redis_password" value="" placeholder="(optional)"><br>				
+							<label for="redis_ssl_sel">Use SSL</label>
+							<select name="redis_ssl_sel" id="redis_ssl_sel" style="width:350px;" class="select form-control">
+								<option value="0" selected>No</option>
+								<option value="1">Yes</option>
+							</select>
+						</div>
+					</div>
+				</div>
+			</div>
+						
 			
-			
-			<!-- Step 1 Webserver -->
+			<!-- Step 2 Webserver -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="webserver1">
-				<h3>Webserver 1/2</h3>
+				<h3 style="display:none">Webserver 1/2</h3>
 
 				<div class="wizard-input-section">
 					<div class="form-group">
@@ -123,44 +176,42 @@
 						<select name="logip_sel" id="logip_sel" style="width:350px;" class="select form-control">
 								<option value="0" selected>No</option>
 								<option value="1">Yes</option>
+						</select><br>
+						
+							  <label for="showfilename_sel">Include filename in download URL</label>
+						<select name="showfilename_sel" id="showfilename_sel" style="width:350px;" class="select form-control">
+								<option value="0" selected>No</option>
+								<option value="1">Yes</option>
 						</select>
 					</div>
 				</div>
 			</div>
 			
-			<!-- Step 2 Webserver 2 -->
+			<!-- Step 3 Webserver 2 -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="webserver2">
-				<h3>Webserver 2/2</h3>
+				<h3 style="display:none">Webserver 2/2</h3>
 
 				<div class="wizard-input-section">
 					<div class="form-group">
 
-							<div class="col-sm-8">
 							  <label for="public_name">Public Name:</label>
 								<input type="text" class="form-control" id="public_name" name="public_name" value="Gokapi" placeholder="Public Name" required>
-							</div><br><br><br>
-							<div class="col-sm-8">
-							  <label for="port">Port:</label>
+							  <br><label for="port">Port:</label>
 {{ if .IsDocker }}
 							<input type="number" class="form-control" id="port" value="53842" placeholder="Port number" disabled>
 							<input type="hidden" class="form-control" name="port" value="53842">
 {{ else }}
 							<input type="number" class="form-control" id="port" name="port" value="53842" min="1" max="65535" placeholder="Port number" data-min="1" data-validate="validateMinLength" required onChange="urlParamChanged()">
 {{ end }}
-							</div><br><br><br>
 							
 
-							<div class="col-sm-8">
-							  <label for="url">Public facing URL:</label>
-								<input type="text" class="form-control" id="url" name="url" value="http://127.0.0.1:53842/" onfocusout="extUrlChanged(this)" placeholder="Public URL" data-min="8" required data-validate="validateUrl">
-							</div><br><br><br>
+							  <br><label for="url">Public facing URL:</label>
+								<input type="text" class="form-control" id="url" name="url" value="http://127.0.0.1:53842/" placeholder="Public URL" data-min="8" required data-validate="validateUrl">
 							
 							
 
-							<div class="col-sm-8">
-							  <label for="url_redirection">Redirection URL for the index:</label>
+							  <br><label for="url_redirection">Redirection URL for the index:</label>
 								<input type="text" class="form-control" id="url_redirection" name="url_redirection" value="https://github.com/Forceu/Gokapi/" placeholder="Redirection URL" required data-min="1" data-validate="validateMinLength">
-							</div>
 						</div>
 				</div>
 			</div>
@@ -168,9 +219,9 @@
 			
 
 
-			<!-- Step 3 Auth -->
+			<!-- Step 4 Auth -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="authentication">
-				<h3>Authentication</h3>
+				<h3 style="display:none">Authentication</h3>
 
 				<div class="wizard-input-section">
 					<div class="form-group">
@@ -186,8 +237,8 @@
 							</optgroup>
 
 							<optgroup label="Reverse Proxy">
-								<option value="2">Header Authentication</option>
-								<option value="3">Access Restriction</option>
+								<option value="2">Trusted Header Authentication</option>
+								<option value="3">Disabled / Access Restriction</option>
 							</optgroup>
 
 						</select>
@@ -195,9 +246,9 @@
 				</div>
 			</div>
 
-			<!-- Step 4 Credentials PW -->
+			<!-- Step 5a Credentials PW -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="credentials">
-				<h3>Credentials</h3>
+				<h3 style="display:none">Credentials</h3>
 
 
 				<div class="wizard-input-section">
@@ -210,10 +261,10 @@
 								<input type="text" class="form-control" id="auth_username" name="auth_username" placeholder="Username" data-min="3" required data-validate="validateMinLength">
 							</div><br><br>
 							<div class="col-sm-8">
-								<input type="password" autocomplete="new-password" class="form-control" id="auth_pw" name="auth_pw" placeholder="Password" data-min="8" required data-validate="validatePassword">
+								<input type="password" autocomplete="new-password" class="form-control" id="auth_pw" name="auth_pw" placeholder="Password" data-min={{ .MinPasswordLength }} required data-validate="validatePassword">
 							</div><br><br>
 							<div class="col-sm-8">
-								<input type="password" autocomplete="new-password" class="form-control" id="auth_pw2" name="auth_pw2" placeholder="Password (repeat)" data-min="8" required>
+								<input type="password" autocomplete="new-password" class="form-control" id="auth_pw2" name="auth_pw2" placeholder="Password (repeat)" data-min={{ .MinPasswordLength }} required>
 						</div>
 					</div>
 
@@ -221,15 +272,15 @@
 				</div>
 			</div>
 			
-			<!-- Step 4 Credentials Oauth -->
+			<!-- Step 5b Credentials Oauth -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="credentials-oauth">
-				<h3>Credentials</h3>
+				<h3 style="display:none">Credentials</h3>
 
 
 					<div class="wizard-input-section">
 						<div class="form-group">
 					<p>
-						Please enter the OIDC client configuration. Multiple users and groups can be separated with a semicolon. The <a href="https://gokapi.readthedocs.io/en/stable/setup.html#oauth2-openid-connect" target="_blank" rel="noopener noreferrer">documentation</a> has examples on how to configure for different providers.<br>
+						Please enter the OIDC client configuration. Groups can be separated with a semicolon. The <a href="https://gokapi.readthedocs.io/en/stable/setup.html#oauth2-openid-connect" target="_blank" rel="noopener noreferrer">documentation</a> has examples on how to configure for different providers.<br>
 					</p>
 
 							<div class="col-sm-8" style="width:90%">
@@ -247,6 +298,10 @@
 								<input type="text" class="form-control" id="oauth_secret" name="oauth_secret" placeholder="Client Secret" data-min="1" required data-validate="validateMinLength">
 							</div>
 							<div class="col-sm-8" style="width:90%">
+							  <label for="oauth_admin_user">Admin email address:</label>
+								<input type="text" class="form-control" id="oauth_admin_user" name="oauth_admin_user" placeholder="Admin email address" data-min="3" required data-validate="validateMinLength">
+							</div>
+							<div class="col-sm-8" style="width:90%">
 							Recheck identity every 
 							<select name="oauth_recheck_interval" id="oauth_recheck_interval" style="width:350px;" class="select form-control">
 								<option value="6"> 6 hours</option>
@@ -262,28 +317,26 @@
 							<br>Restrict to:
 								  <div class="oauthscopecontainer">
 								    <div class="oauthscopes">
-								      <input type="hidden" name="oauth_restrict_users.unchecked" value="false"/>
-								      <input type="checkbox" id="oauth_restrict_users" name="oauth_restrict_users" onchange="handleOauthCheckboxChange(this)"  value="true">
-								      <label id="label_ousers" for="oauth_restrict_users" class="checkboxLabel">Users &nbsp;</label>
-								      <input type="text" id="oauth_scope_users" name="oauth_scope_users" class="input-field" placeholder="Scope identifier" data-min="1" data-validate="validateMinLength" disabled>&nbsp;
-								      <input type="text" id="oauth_allowed_users" name="oauth_allowed_users" class="input-field" placeholder="Authorised users" data-min="1" data-validate="validateMinLength" disabled>
-								    </div>
-
-								    <div class="oauthscopes">
-								      <input type="hidden" name="oauth_restrict_groups.unchecked" value="false"/>
+								      <input type="hidden" name="oauth_restrict_groups.unchecked" value="false">
 								      <input type="checkbox" id="oauth_restrict_groups" name="oauth_restrict_groups" onchange="handleOauthCheckboxChange(this)"  value="true">
 								      <label id="label_ogroups" for="oauth_restrict_groups" class="checkboxLabel">Groups</label>
 								      <input type="text" id="oauth_scope_groups" name="oauth_scope_groups" class="input-field" placeholder="Scope identifier" data-min="1" data-validate="validateMinLength" disabled>&nbsp;
 								      <input type="text" id="oauth_allowed_groups" name="oauth_allowed_groups" class="input-field" placeholder="Authorised groups" data-min="1" data-validate="validateMinLength" disabled>
 								    </div>
+								    
+								     <div><br>
+								     <input type="hidden" name="oauth_only_registered_users.unchecked" value="false">
+								     <input  id="oauth_only_registered_users" name="oauth_only_registered_users" type="checkbox" value="true">
+								     <span>&nbsp;Only allow already existing users to log in</span>
+								     </div>
 								  </div>
 							</div> 
 							<div class="col-sm-8" style="width:90%">
 							 <label for="oauth_redir"><br>Redirection URL:</label>
 {{ if .IsInitialSetup }}
-								<input type="text" class="form-control" id="oauth_redir" name="oauth_redir" disabled value="http://127.0.0.1:53842/oauth-callback">
+								<input type="text" style="cursor:default" class="form-control" id="oauth_redir" name="oauth_redir" disabled value="http://127.0.0.1:53842/oauth-callback">
 {{ else }}
-								<input type="text" class="form-control" id="oauth_redir" name="oauth_redir" disabled value="{{ .Settings.ServerUrl }}oauth-callback">
+								<input type="text" style="cursor:default" class="form-control" id="oauth_redir" name="oauth_redir" disabled value="{{ .Settings.ServerUrl }}oauth-callback">
 {{ end }}
 							</div><br><br>
 
@@ -292,32 +345,37 @@
 				</div>
 			</div>
 			
-			<!-- Step 4 Credentials Header -->
+			<!-- Step 5c Credentials Header -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="credentials-header">
-				<h3>Credentials</h3>
+				<h3 style="display:none">Credentials</h3>
 
 
 				<div class="wizard-input-section">
 						<div class="form-group">
 					<p>
-						Enter the key of the header that will be provided from your reverse proxy containing the username.<br>Add the allowed users to the list below (seperated by semicolon) or leave it blank if access is granted to all authenticated users.<br><br>
+						Enter the key of the header that will be provided from your reverse proxy containing the username.<br><br>
 					</p>
 
-							<div class="col-sm-8">
+							<p>
 							  <label for="auth_headerkey">Header Key:</label>
-								<input type="text" class="form-control" id="auth_headerkey" name="auth_headerkey" required placeholder="Header Key" data-validate="validateMinLength">
-							</div><br><br>
+								<input type="text" class="form-control" id="auth_headerkey" name="auth_headerkey" data-min="1" required placeholder="Header Key" data-validate="validateMinLength">
+							</p>
 							
-							<div class="col-sm-8">
-							  <label for="auth_header_users">Authorised users:</label>
-								<input type="text" class="form-control" id="auth_header_users" name="auth_header_users" placeholder="Authorised users">
-							</div>
+							<p>
+							  <label for="auth_header_admin">Admin user name:</label>
+								<input type="text" class="form-control" id="auth_header_admin" name="auth_header_admin" data-min="3"  data-validate="validateMinLength" required placeholder="Admin user name">
+							</p>
+						
+						    <br>
+						     <input type="hidden" name="auth_header_only_registered_users.unchecked" value="false">
+						     <input id="auth_header_only_registered_users" name="auth_header_only_registered_users" type="checkbox" value="true">
+						     <span>&nbsp;Only allow already existing users to log in</span>
 					</div>
 				</div>
 			</div>
-			<!-- Step 4 Credentials Disbabled -->
+			<!-- Step 5d Credentials Disbabled -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="credentials-disabled">
-				<h3>Credentials</h3>
+				<h3 style="display:none">Credentials</h3>
 
 
 				<div class="wizard-input-section">
@@ -326,7 +384,7 @@
 						
 						<ul>
 {{ range .ProtectedUrls }}
-						  <li>{{ . }}</li>
+						  <li><code>{{ . }}</code></li>
 {{ end }}
 						</ul>
 
@@ -338,13 +396,13 @@
 
 
 
-			<!-- Step 5 Storage -->
+			<!-- Step 6 Storage -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="storage">
-				<h3>Storage</h3>
+				<h3 style="display:none">Storage</h3>
 
 				<div class="wizard-input-section">
 					<p>
-						Select if you want to store files locally or on an S3 compatible cloud infrastructure
+						Choose whether to store files locally or on an S3-compatible cloud infrastructure.
 					</p>
 
 					<select name="storage_sel" id="storage_sel" style="width:350px;" class="select form-control" onchange="storageSelectionChanged(this.selectedIndex);">
@@ -355,16 +413,31 @@
 					
 {{ if not .HasAwsFeature }}
 					<p><br><br><i>This build has been compiled without AWS support, therefore cloud storage is not available.</i></p>
+					
+			  				<input type="hidden" id="storage_sel_image" name="storage_sel_image" value="nochange">
+
+						</select>
 {{ else }}
 
-					<br><p>
-						Select if you want to store pictures always locally. Choose this if you want to use full encryption but still be able to have hotlink support.
-					</p>
-					<select name="storage_sel_image" id="storage_sel_image" style="width:350px;" class="select form-control">
-							<option value="nochange" selected>As above</option>
-							<option value="local">Always local Storage</option>
+					<div id="cloudstorage_options" style="visibility: hidden">
 
-					</select>
+						<br><p>
+							Location for picture files: Select local storage if you require full encryption but still need hotlink support.
+						</p>
+						<select name="storage_sel_image" id="storage_sel_image" style="width:350px;" class="select form-control">
+								<option value="nochange" selected>Use cloud storage</option>
+								<option value="local">Use local storage for pictures</option>
+
+						</select>
+						<br><p>
+							To conserve bandwidth, Gokapi defaults to redirecting to pre-signed S3 download URLs. If you prefer not to use this feature or if your S3 server is only accessible from your internal network, select the "Proxy downloads" option below.
+						</p>
+						<select name="storage_sel_proxy" id="storage_sel_proxy" style="width:350px;" class="select form-control">
+								<option value="presigned" selected>Default</option>
+								<option value="proxy">Proxy downloads</option>
+
+						</select>
+					</div>
 {{ end }}
 					
 
@@ -372,14 +445,15 @@
 			</div>
 			
 			
-			<!-- Step 6 S3 Credentials -->
+			<!-- Step 7 S3 Credentials -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="s3credentials">
-				<h3>S3 Credentials</h3>
+				<h3 style="display:none">S3 Credentials</h3>
 
 				<div class="wizard-input-section">
 				
 					<div class="form-group">
 							<div class="col-sm-8">
+{{ if not .S3EnvProvided }}
 							  <label for="s3_bucket">Bucket Name:</label>
 								<input type="text" class="form-control" id="s3_bucket" name="s3_bucket" placeholder="Bucket Name" data-min="1" data-validate="validateMinLength">
 							</div><br><br>
@@ -397,6 +471,10 @@
 								<input type="text" class="form-control" id="s3_secret" name="s3_secret" placeholder="API Key Secret" required data-min="1" data-validate="validateMinLength">
 							</div><br><br>
 							<div class="col-sm-8">
+								<label for="s3_expiration">Link expiration(Seconds):</label>
+								  <input type="number" class="form-control" id="s3_expiration" name="s3_expiration" placeholder="Expiration (Default: 15s)">
+							</div><br><br>
+							<div class="col-sm-8">
 							  <label for="s3_endpoint">Endpoint:</label>
 								<input type="text" class="form-control" id="s3_endpoint" name="s3_endpoint" placeholder="Endpoint (leave blank if AWS S3)">
 							</div><br><br>
@@ -406,56 +484,110 @@
 							<br><br>
 	  						 <button id="downloadbutton" class="btn btn-light" type="button" onclick="TestAWS(this);">
 			  					Test configuration
+			  				</button>	
+{{ else }}
+							Credentials have been provided with environment variables and cannot be changed.
+							<br><br>
+	  						 <button id="downloadbutton" class="btn btn-light" type="button" onclick="TestAWS(this, false);">
+			  					Test configuration
 			  				</button>
+			  				<input type="hidden" id="s3_bucket" name="s3_bucket">
+			  				<input type="hidden" id="s3_region" name="s3_region" >
+			  				<input type="hidden" id="s3_api" name="s3_api">
+			  				<input type="hidden" id="s3_secret" name="s3_secret">
+			  				<input type="hidden" id="s3_endpoint" name="s3_endpoint">
+			  				<input type="hidden" id="s3_expiration" name="s3_expiration">
+{{ end }}			
 							</div>
 						</div>
 				</div>
 			</div>
 
 <script>
-function TestAWS(button) {
-	button.disabled=true;
-	button.innerHTML="Connecting...";
 
-	var xhr = new XMLHttpRequest();
-	xhr.onreadystatechange = function() {
-		if (this.readyState === XMLHttpRequest.DONE) {
-			if (this.status == 200) {
-				button.innerHTML="Test configuration";
-				button.disabled=false;
-				alert(xhr.responseText);
-		    	} else {
-			alert("ey");
-			// Server Error
-			}
-		}
-	};
+function TestAWS(button, isManual) {
 
-	xhr.open("POST", "./testaws", true);
-	xhr.setRequestHeader('Content-Type', 'application/json');
-	xhr.send(JSON.stringify({
-	    bucket: document.getElementById("s3_bucket").value,
-	    region: document.getElementById("s3_region").value,
-	    apikey: document.getElementById("s3_api").value,
-	    apisecret: document.getElementById("s3_secret").value,
-	    endpoint: document.getElementById("s3_endpoint").value,
-		expiration: parseInt(document.getElementById("s3_expiration").value) //TODO handle conversion error
-	}));
+    button.disabled = true;
+{{ if .IsInitialSetup }}
+    if (sessionStorage.getItem("awstestpw") == null || sessionStorage.getItem("awstestpw") == "") {
+        let pw = window.prompt("To test the AWS connection, a password is required.\nPlease enter the password that is displayed in the console output.", "");
+        if (pw == "" || pw == null) {
+    	    button.disabled = false;
+            return;
+        }
+        sessionStorage.setItem("awstestpw", pw);
+
+    }
+{{ end }}
+
+    button.innerHTML = "Connecting...";
+
+    var xhr = new XMLHttpRequest();
+    xhr.onreadystatechange = function() {
+        if (this.readyState === XMLHttpRequest.DONE) {
+            button.innerHTML = "Test configuration";
+            button.disabled = false;
+
+            let response = {};
+            try {
+                response = JSON.parse(xhr.responseText);
+            } catch (e) {
+                response = {
+                    result: "Error: Could not parse server response."
+                };
+            }
+
+
+            switch (this.status) {
+                case 200:
+                    alert(response.result || "Test OK.");
+                    break;
+                case 401:
+                    sessionStorage.setItem("awstestpw", "");
+                    alert("Incorrect AWS Test Password.\nPlease enter the password that is displayed in the console output.");
+                    break;
+                default:
+                    const errorMessage = response.result || "An unexpected error occurred";
+                    alert(`Error: ${errorMessage}`);
+            }
+        }
+    };
+
+    xhr.open("POST", "./testaws", true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    if (isManual) {
+        xhr.send(JSON.stringify({
+            bucket: document.getElementById("s3_bucket").value,
+            region: document.getElementById("s3_region").value,
+            apikey: document.getElementById("s3_api").value,
+            apisecret: document.getElementById("s3_secret").value,
+            endpoint: document.getElementById("s3_endpoint").value,
+            setupPassword: sessionStorage.getItem("awstestpw"),
+            isEnvProvided: false,
+			expiration: document.getElementById("s3_expiration").value
+        }));
+    } else {
+        xhr.send(JSON.stringify({
+            setupPassword: sessionStorage.getItem("awstestpw"),
+            isEnvProvided: true
+        }));
+    }
 
 }
+
 </script>
 			
 
 			<!-- Step 7 Encryption -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="encryption">
-				<h3>Encryption Level</h3>
+				<h3 style="display:none">Encryption Level</h3>
 
 				<div class="wizard-input-section">
 						<div class="form-group">
 					
 {{ if not .IsInitialSetup }}
 				<p>
-					<span style="color:red"><b>Warning:</b> Changing the encryption level will delete all existing encrypted files! Other existing files will remain unencrypted.
+					<span style="color:red"><b>Warning:</b> Changing the encryption level will delete all existing encrypted files! Other existing files will remain unencrypted.</span>
 				</p><br>
 {{ end }}
 					
@@ -490,7 +622,7 @@ function TestAWS(button) {
 					  <li>Does not support download progress bar</li>
 					  <li>Gokapi starts without user input</li>
 					  <li><b>Warning:</b> Password can be read with access to Gokapi configuration</li>
-					  <li><b>Warning:</b> During upload temporary files containing the plaintext content may be created.</li>
+					  <li><b>Warning:</b> During upload, temporary files containing the plaintext content may be created.</li>
 					  <li><b>Warning:</b> Encryption has not been audited.</li>
 					</ul></p>
 					</div>
@@ -504,7 +636,7 @@ function TestAWS(button) {
 					  <li>Does not support download progress bar</li>
 					  <li>Password cannot be read with access to Gokapi configuration</li>
 					  <li><span style="color:red"><b>Warning:</b></span> Gokapi requires user input to start</li>
-					  <li><b>Warning:</b> During upload temporary files containing the plaintext content may be created.</li>
+					  <li><b>Warning:</b> During upload, temporary files containing the plaintext content may be created.</li>
 					  <li><b>Warning:</b> Encryption has not been audited.</li>
 					</ul></p>
 					</div>
@@ -521,7 +653,7 @@ function TestAWS(button) {
 					  <li><b>Important:</b> For remote storage, CORS settings for the bucket need to allow access from the Gokapi URL</li>
 					  <li><b>Warning:</b> Download might be significantly slower</li>
 					  <li><b>Warning:</b> Password can be read with access to Gokapi configuration</li>
-					  <li><b>Warning:</b> During upload temporary files containing the plaintext content may be created.</li>
+					  <li><b>Warning:</b> During upload, temporary files containing the plaintext content may be created.</li>
 					  <li><b>Warning:</b> Encryption has not been audited.</li>
 					</ul></p>
 					</div>
@@ -538,7 +670,7 @@ function TestAWS(button) {
 					  <li><b>Important:</b> For remote storage, CORS settings for the bucket need to allow access from the Gokapi URL</li>
 					  <li><span style="color:red"><b>Warning:</b></span> Gokapi requires user input to start</li>
 					  <li><b>Warning:</b> Download might be significantly slower</li>
-					  <li><b>Warning:</b> During upload temporary files containing the plaintext content may be created.</li>
+					  <li><b>Warning:</b> During upload, temporary files containing the plaintext content may be created.</li>
 					  <li><b>Warning:</b> Encryption has not been audited.</li>
 					</ul></p>
 					</div>
@@ -552,6 +684,7 @@ function TestAWS(button) {
 					  <li>Does not support deduplication</li>
 					  <li>Does not support hotlinks to files</li>
 					  <li>Does not support download progress bar</li>
+					  <li>Does not support replacing existing files with different content</li>
 					  <li>Gokapi starts without user input</li>
 					  <li>Files uploaded through the API have to be unencrypted</li>
 					  <li>Password cannot be read with access to Gokapi configuration</li>
@@ -562,8 +695,8 @@ function TestAWS(button) {
 							
 {{ if not .IsInitialSetup }}
 				     <div id="e2eclear"><br>
-				     <input type="hidden" name="cleare2e.unchecked" value="false"/>
-				     <input name="cleare2e" type="checkbox" value="true"/>
+				     <input type="hidden" name="cleare2e.unchecked" value="false">
+				     <input name="cleare2e" type="checkbox" value="true">
 				     <span>&nbsp;Reset end-to-end password (you will lose access to already encrypted files)</span>
 				     </div>
 
@@ -577,7 +710,7 @@ function TestAWS(button) {
 
 			<!-- Step 8 Encryption PW -->
 			<div class="wizard-card wizard-card-overlay" data-cardname="encryptionpw">
-				<h3>Encryption Master Password</h3>
+				<h3 style="display:none">Encryption Master Password</h3>
 
 				<div class="wizard-input-section">
 						<div class="form-group">
@@ -637,7 +770,7 @@ function TestAWS(button) {
 					</div>
 					If you configured Gokapi to use a password during startup, please enter it now in the console before clicking on continue.<br><br>
 	
-					<a class="btn btn-success im-done">Continue</a>
+					<a id="bt_finishsetup" class="btn btn-success im-done">Continue</a>
 				</div>
 			</div>
 		</div>
@@ -659,10 +792,10 @@ function TestAWS(button) {
 					backdrop: 'static'
 				});
 				
-				
-				
 				wizard.el.find(".wizard-success .im-done").click(function() {
-					window.location.href = $("#url").val()+"admin";
+					document.getElementById("bt_finishsetup").disabled=true;
+					document.getElementById("bt_finishsetup").text="Please wait";
+					setTimeout(function(){ window.location.href = $("#url").val()+"admin";}, 1500);
 				});
 			
 			
@@ -674,6 +807,21 @@ function TestAWS(button) {
 				
 					
 {{ if not .IsInitialSetup }}
+
+	{{ if eq .DatabaseSettings.Type 0}}
+				document.getElementById("sqlite_location").value = {{.DatabaseSettings.HostUrl}};
+	{{ else }}
+				document.getElementById("dbtype_sel").selectedIndex = 1;
+				document.getElementById("redis_location").value = {{.DatabaseSettings.HostUrl}};
+				document.getElementById("redis_prefix").value = {{.DatabaseSettings.RedisPrefix}};
+				document.getElementById("redis_user").value = {{.DatabaseSettings.Username}};
+				document.getElementById("redis_password").value = {{.DatabaseSettings.Password}};
+	{{ end }}
+	{{ if .DatabaseSettings.RedisUseSsl }}
+				document.getElementById("redis_ssl_sel").selectedIndex = 1;
+	{{ end }}
+				dbChanged();
+
 	{{ if and (.LocalhostOnly) (not .IsDocker) }}
 				document.getElementById("localhost_sel").selectedIndex = 1;
 	{{ end }}
@@ -682,6 +830,9 @@ function TestAWS(button) {
 	{{ end }}
 	{{ if .Settings.SaveIp }}
 				document.getElementById("logip_sel").selectedIndex = 1;
+	{{ end }}
+	{{ if .Settings.IncludeFilename }}
+				document.getElementById("showfilename_sel").selectedIndex = 1;
 	{{ end }}
 				document.getElementById("port").value = "{{ .Port }}";
 				document.getElementById("url").value = "{{ .Settings.ServerUrl }}";
@@ -700,14 +851,9 @@ function TestAWS(button) {
 				    document.getElementById("oauth_provider").value = "{{ .Auth.OAuthProvider }}";
 				    document.getElementById("oauth_id").value = "{{ .Auth.OAuthClientId }}";
 				    document.getElementById("oauth_secret").value = "{{ .Auth.OAuthClientSecret }}";
+				    document.getElementById("oauth_admin_user").value = "{{ .Auth.Username }}";
 				    document.getElementById("oauth_recheck_interval").value = "{{ .Auth.OAuthRecheckInterval }}";
-	{{ if ne .OAuthUsers "" }}
-				    document.getElementById("oauth_restrict_users").checked = true;
-				    document.getElementById("oauth_scope_users").disabled = false;
-				    document.getElementById("oauth_scope_users").value = "{{ .Auth.OAuthUserScope }}";
-				    document.getElementById("oauth_allowed_users").disabled = false;
-				    document.getElementById("oauth_allowed_users").value = "{{ .OAuthUsers }}";
-	{{ end }}
+				    document.getElementById("oauth_only_registered_users").checked = {{.Auth.OnlyRegisteredUsers}};
 	{{ if ne .OAuthGroups "" }}
 				    document.getElementById("oauth_restrict_groups").checked = true;
 				    document.getElementById("oauth_scope_groups").disabled = false;
@@ -718,21 +864,33 @@ function TestAWS(button) {
 				    break;
 				  case 2:
 				    document.getElementById("auth_headerkey").value = "{{ .Auth.HeaderKey }}";
-				    document.getElementById("auth_header_users").value = "{{ .HeaderUsers }}";
+				    document.getElementById("auth_header_admin").value = "{{ .Auth.Username }}";
+				    document.getElementById("auth_header_only_registered_users").checked = {{.Auth.OnlyRegisteredUsers}};
 				    break;
 				}
+				
 
-	{{ if .CloudSettings.Aws.Bucket }}				
+{{ end }}
+
+{{ if .CloudSettings.Aws.Bucket }}
 				document.getElementById("storage_sel").value = "cloud";
 				storageSelectionChanged(1);
+
+	{{ if .CloudSettings.Aws.ProxyDownload }}
+				document.getElementById("storage_sel_proxy").value = "proxy";
+	{{ end }}
+
+	{{ if .Settings.PicturesAlwaysLocal }}
+				document.getElementById("storage_sel_image").value = "local";
+	{{ end }}
+
+	{{ if not .S3EnvProvided }}
 				document.getElementById("s3_bucket").value = "{{ .CloudSettings.Aws.Bucket }}";
 				document.getElementById("s3_region").value =  "{{ .CloudSettings.Aws.Region }}";
 				document.getElementById("s3_api").value = "{{ .CloudSettings.Aws.KeyId }}";
 				document.getElementById("s3_secret").value =  "{{ .CloudSettings.Aws.KeySecret }}";
 				document.getElementById("s3_endpoint").value =  "{{ .CloudSettings.Aws.Endpoint }}";
 	{{ end }}
-				
-				
 {{ end }}
 
 
@@ -740,8 +898,6 @@ function TestAWS(button) {
 				
 				    /* enable inputs again, otherwise they will not be submitted */
 				    document.getElementById("oauth_scope_groups").disabled = false;
-				    document.getElementById("oauth_scope_users").disabled = false;
-				    document.getElementById("oauth_allowed_users").disabled = false;
 				    document.getElementById("oauth_allowed_groups").disabled = false;
 					
 					 $.ajax({
@@ -768,6 +924,9 @@ function TestAWS(button) {
 
 			});
 			
+			
+			function parseAndSetDbString(input) {
+			}
 			
 			function validateMinLength(el) {
 				let value = el.val();
@@ -870,10 +1029,15 @@ function TestAWS(button) {
 
 			function storageSelectionChanged(index) {
 				let card = wizard.cards["s3credentials"];
-				if (index==0) 
+				let storageOptDiv = document.getElementById("cloudstorage_options");
+				if (index==0) {
 					card.disable(true);
-				else if (index==1) 
+					storageOptDiv.style.visibility="hidden";
+				} else {
 					card.enable();
+					storageOptDiv.style.visibility="visible";
+				}
+					
 			}
 
 			$(function() {
@@ -900,13 +1064,17 @@ function TestAWS(button) {
 			
 
 				
-			function extUrlChanged(el) {
+			function extUrlChanged() {
+				let el = document.getElementById("url");
 				let lastChar = el.value.substr(-1); 
 				if (lastChar != '/') 
 					el.value = (el.value + '/') 
 					
 				document.getElementById("oauth_redir").value = el.value + "oauth-callback";
 			}
+			
+			
+			document.getElementById("url").addEventListener("focusout", extUrlChanged);
 			
 {{ if .IsInitialSetup }}
 			var previousPort = "53842";
@@ -929,6 +1097,22 @@ function TestAWS(button) {
 						document.getElementById("url").value = "https://127.0.0.1:" + port + "/";
 				}
 				previousPort = port;
+			}
+			
+			
+			
+			function dbChanged() {
+				let divSqlite = document.getElementById("divsqlite");
+				let divRedis = document.getElementById("divredis");
+				let dbType = document.getElementById("dbtype_sel").value;
+				
+				if (dbType == "0") {
+					divSqlite.style.display = "block";
+					divRedis.style.display = "none";
+				} else {
+					divSqlite.style.display = "none";
+					divRedis.style.display = "block";
+				}
 			}
 				
 				
@@ -954,6 +1138,7 @@ function TestAWS(button) {
 
 			}
 
+		
 			
 		</script>
 	</body>

@@ -4,26 +4,24 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/helper"
-	"github.com/forceu/gokapi/internal/storage/processingstatus"
-	"github.com/forceu/gokapi/internal/test"
-	"github.com/forceu/gokapi/internal/test/testconfiguration"
-	"github.com/juju/ratelimit"
-	"github.com/r3labs/sse/v2"
-	"golang.org/x/sync/errgroup"
 	"mime/multipart"
 	"net/textproto"
 	"net/url"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/test"
+	"github.com/forceu/gokapi/internal/test/testconfiguration"
+	"github.com/juju/ratelimit"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestMain(m *testing.M) {
 	testconfiguration.Create(false)
 	configuration.Load()
-	processingstatus.Init(sse.New())
 	exitVal := m.Run()
 	testconfiguration.Delete()
 	os.Exit(exitVal)
@@ -140,7 +138,7 @@ func TestParseContentType(t *testing.T) {
 		strings.NewReader(data.Encode()))
 	err := r.ParseForm()
 	test.IsNil(t, err)
-	contentType := parseContentType(r)
+	contentType := parseContentType(r, "test.unknown")
 	test.IsEqualString(t, contentType, "test/unknown")
 
 	data.Set("filecontenttype", "")
@@ -149,7 +147,7 @@ func TestParseContentType(t *testing.T) {
 		strings.NewReader(data.Encode()))
 	err = r.ParseForm()
 	test.IsNil(t, err)
-	contentType = parseContentType(r)
+	contentType = parseContentType(r, "test.unknown")
 	test.IsEqualString(t, contentType, "application/octet-stream")
 
 	for _, imageExt := range imageFileExtensions {
@@ -159,7 +157,7 @@ func TestParseContentType(t *testing.T) {
 			strings.NewReader(data.Encode()))
 		err = r.ParseForm()
 		test.IsNil(t, err)
-		contentType = parseContentType(r)
+		contentType = parseContentType(r, "test"+imageExt)
 		test.IsNotEqualString(t, contentType, "application/octet-stream")
 		test.IsNotEqualString(t, contentType, "")
 		test.IsEqualBool(t, strings.Contains(contentType, "image/"), true)
@@ -273,6 +271,9 @@ func TestGetFileByChunkId(t *testing.T) {
 	file, err := GetFileByChunkId("testchunk")
 	test.IsEqualString(t, file.Name(), "test/data/chunk-testchunk")
 	test.IsNil(t, err)
+	err = os.Chmod("test/data/chunk-testchunk", 0222)
+	_, err = GetFileByChunkId("testchunk")
+	test.IsNotNil(t, err)
 	err = os.Remove(file.Name())
 	test.IsNil(t, err)
 }
@@ -286,7 +287,7 @@ func TestNewChunk(t *testing.T) {
 	header := multipart.FileHeader{
 		Size: 21,
 	}
-	err := NewChunk(strings.NewReader("This is a test content"), &header, info)
+	err := NewChunk(strings.NewReader("This is a test content"), &header, info, 100000)
 	test.IsNil(t, err)
 	test.IsEqualString(t, sha1sumFile("test/data/chunk-testuuid12345"), "a69ec3c3a031e3540d0c2a864ca931f3d54e2c13")
 
@@ -294,24 +295,24 @@ func TestNewChunk(t *testing.T) {
 	header = multipart.FileHeader{
 		Size: 11,
 	}
-	err = NewChunk(strings.NewReader("More content"), &header, info)
+	err = NewChunk(strings.NewReader("More content"), &header, info, 100000)
 	test.IsNil(t, err)
 	test.IsEqualString(t, sha1sumFile("test/data/chunk-testuuid12345"), "8794d8352fae46b83bab83d3e613dde8f0244ded")
 
 	info.Offset = 99
-	err = NewChunk(strings.NewReader("More content"), &header, info)
+	err = NewChunk(strings.NewReader("More content"), &header, info, 100000)
 	test.IsNotNil(t, err)
 
 	err = os.Remove("test/data/chunk-testuuid12345")
 	test.IsNil(t, err)
 
 	info.TotalFilesizeBytes = -4
-	err = NewChunk(strings.NewReader("More content"), &header, info)
+	err = NewChunk(strings.NewReader("More content"), &header, info, 100000)
 	test.IsNotNil(t, err)
 
 	info.TotalFilesizeBytes = 100
 	info.UUID = "../../../../../../../../../../invalid"
-	err = NewChunk(strings.NewReader("More content"), &header, info)
+	err = NewChunk(strings.NewReader("More content"), &header, info, 100000)
 	test.IsNotNil(t, err)
 
 	// Testing simultaneous writes
@@ -341,7 +342,7 @@ func writeRateLimitedChunk(firstHalf bool) error {
 	}
 	content := []byte(helper.GenerateRandomString(500 * 1024))
 	bucket := ratelimit.NewBucketWithRate(400*1024, 400*1024)
-	err := NewChunk(ratelimit.Reader(bytes.NewReader(content), bucket), &header, info)
+	err := NewChunk(ratelimit.Reader(bytes.NewReader(content), bucket), &header, info, 2000000)
 	return err
 }
 
@@ -361,4 +362,106 @@ func sha1sumFile(filename string) string {
 	}
 	sha.Write(filecontent)
 	return hex.EncodeToString(sha.Sum(nil))
+}
+
+func TestParseFileHeaderSanitisation(t *testing.T) {
+	// Path traversal in filename must be neutralised.
+	data := url.Values{}
+	data.Set("filename", "../../etc/passwd")
+	data.Set("filecontenttype", "text/plain")
+	data.Set("filesize", "100")
+	_, r := test.GetRecorder("POST", "/uploadComplete", nil, []test.Header{
+		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
+		strings.NewReader(data.Encode()))
+	header, err := ParseFileHeader(r)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.HasPrefix(header.Filename, ".."), false)
+	test.IsEqualBool(t, strings.Contains(header.Filename, "/"), false)
+
+	// CRLF in filename must be stripped so it cannot inject HTTP headers.
+	data.Set("filename", "file.txt\r\nX-Evil: injected")
+	_, r = test.GetRecorder("POST", "/uploadComplete", nil, []test.Header{
+		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
+		strings.NewReader(data.Encode()))
+	header, err = ParseFileHeader(r)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.Contains(header.Filename, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(header.Filename, "\n"), false)
+	test.IsEqualString(t, r.Header.Get("X-Evil"), "")
+
+	// Null byte in filename must be stripped.
+	data.Set("filename", "file\x00.txt")
+	_, r = test.GetRecorder("POST", "/uploadComplete", nil, []test.Header{
+		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
+		strings.NewReader(data.Encode()))
+	header, err = ParseFileHeader(r)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.Contains(header.Filename, "\x00"), false)
+
+	// CRLF in content-type (supplied via filecontenttype form field)
+	// must be sanitised before being stored.
+	data.Set("filename", "safe.txt")
+	data.Set("filecontenttype", "text/plain\r\nX-Injected: evil")
+	_, r = test.GetRecorder("POST", "/uploadComplete", nil, []test.Header{
+		{Name: "Content-type", Value: "application/x-www-form-urlencoded"}},
+		strings.NewReader(data.Encode()))
+	header, err = ParseFileHeader(r)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.Contains(header.ContentType, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(header.ContentType, "\n"), false)
+	test.IsEqualString(t, r.Header.Get("X-Injected"), "")
+}
+
+func TestParseMultipartHeaderSanitisation(t *testing.T) {
+	// Filename with path traversal must be sanitised.
+	mimeHeader := make(textproto.MIMEHeader)
+	mimeHeader.Set("Content-Type", "text/plain")
+	traversalHeader := multipart.FileHeader{
+		Filename: "../../etc/passwd",
+		Size:     42,
+		Header:   mimeHeader,
+	}
+	header, err := ParseMultipartHeader(&traversalHeader)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.HasPrefix(header.Filename, ".."), false)
+	test.IsEqualBool(t, strings.Contains(header.Filename, "/"), false)
+
+	// CRLF in filename must be stripped.
+	mimeHeader = make(textproto.MIMEHeader)
+	mimeHeader.Set("Content-Type", "text/plain")
+	crlfFilenameHeader := multipart.FileHeader{
+		Filename: "report.pdf\r\nSet-Cookie: session=evil",
+		Size:     10,
+		Header:   mimeHeader,
+	}
+	header, err = ParseMultipartHeader(&crlfFilenameHeader)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.Contains(header.Filename, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(header.Filename, "\n"), false)
+
+	// Content-Type with CRLF injection must be sanitised.
+	// This covers the missing SanitiseContentType call in ParseMultipartHeader.
+	mimeHeader = make(textproto.MIMEHeader)
+	mimeHeader.Set("Content-Type", "text/plain\r\nX-Injected: evil")
+	crlfContentTypeHeader := multipart.FileHeader{
+		Filename: "safe.txt",
+		Size:     10,
+		Header:   mimeHeader,
+	}
+	header, err = ParseMultipartHeader(&crlfContentTypeHeader)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.Contains(header.ContentType, "\r"), false)
+	test.IsEqualBool(t, strings.Contains(header.ContentType, "\n"), false)
+
+	// Null byte in Content-Type must be stripped.
+	mimeHeader = make(textproto.MIMEHeader)
+	mimeHeader.Set("Content-Type", "text/plain\x00evil")
+	nullByteHeader := multipart.FileHeader{
+		Filename: "safe.txt",
+		Size:     10,
+		Header:   mimeHeader,
+	}
+	header, err = ParseMultipartHeader(&nullByteHeader)
+	test.IsNil(t, err)
+	test.IsEqualBool(t, strings.Contains(header.ContentType, "\x00"), false)
 }

@@ -1,48 +1,34 @@
 package processingstatus
 
 import (
-	"github.com/forceu/gokapi/internal/configuration/database"
-	"github.com/forceu/gokapi/internal/helper"
 	"github.com/forceu/gokapi/internal/models"
-	"github.com/r3labs/sse/v2"
-	"time"
+	"github.com/forceu/gokapi/internal/storage/processingstatus/pstatusdb"
+	"github.com/forceu/gokapi/internal/webserver/sse"
 )
 
-// StatusHashingOrEncrypting indicates that the file has been completely uploaded, but is now processed by Gokapi
+// StatusHashingOrEncrypting indicates that the file has been completely uploaded but is now processed by Gokapi
 const StatusHashingOrEncrypting = 0
 
-// StatusUploading indicates that the file has been processed, but is now moved to the data filesystem
+// StatusUploading indicates that the file has been processed but is now moved to the data filesystem
 const StatusUploading = 1
 
-var sseServer *sse.Server
+// StatusFinished indicates that the file has been fully processed and uploaded
+const StatusFinished = 2
 
-// Init passes the SSE server, so that notifications can be sent
-func Init(srv *sse.Server) {
-	sseServer = srv
-}
-
-func passNewStatus(newStatus models.UploadStatus) {
-	if sseServer == nil {
-		panic("sseServer not initialised")
-	}
-	status, err := newStatus.ToJson()
-	helper.Check(err)
-	sseServer.Publish("changes", &sse.Event{
-		Data: status,
-	})
-}
+// StatusError indicates that there was an error during the upload
+const StatusError = 3
 
 // Set sets the status for an id
-func Set(id string, status int) {
+func Set(id string, status int, file models.File, userId int, err error) {
 	newStatus := models.UploadStatus{
 		ChunkId:       id,
 		CurrentStatus: status,
-		LastUpdate:    time.Now().Unix(),
+		FileId:        file.Id,
+		UserId:        userId,
 	}
-	oldStatus, ok := database.GetUploadStatus(newStatus.ChunkId)
-	if ok && oldStatus.LastUpdate > newStatus.LastUpdate {
-		return
+	if err != nil {
+		newStatus.ErrorMessage = err.Error()
 	}
-	passNewStatus(newStatus)
-	database.SaveUploadStatus(newStatus)
+	pstatusdb.Set(newStatus)
+	go sse.PublishNewStatus(newStatus)
 }

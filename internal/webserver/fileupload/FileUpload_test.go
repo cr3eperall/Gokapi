@@ -3,13 +3,6 @@ package fileupload
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/configuration/database"
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/forceu/gokapi/internal/storage/processingstatus"
-	"github.com/forceu/gokapi/internal/test"
-	"github.com/forceu/gokapi/internal/test/testconfiguration"
-	"github.com/r3labs/sse/v2"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -19,12 +12,17 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/test"
+	"github.com/forceu/gokapi/internal/test/testconfiguration"
 )
 
 func TestMain(m *testing.M) {
 	testconfiguration.Create(false)
 	configuration.Load()
-	processingstatus.Init(sse.New())
+	configuration.ConnectDatabase()
 	exitVal := m.Run()
 	testconfiguration.Delete()
 	os.Exit(exitVal)
@@ -38,43 +36,38 @@ func TestParseConfig(t *testing.T) {
 		isE2E:            "",
 		realSize:         "",
 	}
-	config, err := parseConfig(data, false)
+	config, err := parseConfig(data)
 	test.IsNil(t, err)
 	test.IsEqualBool(t, config.IsEndToEndEncrypted, false)
 	test.IsEqualInt64(t, config.RealSize, 0)
 
-	defaults := database.GetUploadDefaults()
 	test.IsEqualInt(t, config.AllowedDownloads, 9)
 	test.IsEqualString(t, config.Password, "123")
 	test.IsEqualInt(t, config.Expiry, 5)
-	test.IsEqualInt(t, defaults.Downloads, 3)
 
-	config, err = parseConfig(data, true)
+	config, err = parseConfig(data)
 	test.IsNil(t, err)
-	defaults = database.GetUploadDefaults()
-	test.IsEqualInt(t, defaults.Downloads, 9)
-	database.SaveUploadDefaults(models.LastUploadValues{Downloads: 3, TimeExpiry: 20})
 
 	data.allowedDownloads = ""
 	data.expiryDays = "invalid"
 
-	config, err = parseConfig(data, false)
+	config, err = parseConfig(data)
 	test.IsNil(t, err)
-	test.IsEqualInt(t, config.AllowedDownloads, 3)
-	test.IsEqualInt(t, config.Expiry, 20)
+	test.IsEqualInt(t, config.AllowedDownloads, 1)
+	test.IsEqualInt(t, config.Expiry, 14)
 	test.IsEqualBool(t, config.UnlimitedTime, false)
 	test.IsEqualBool(t, config.UnlimitedDownload, false)
 
 	data.allowedDownloads = "0"
 	data.expiryDays = "0"
-	config, err = parseConfig(data, false)
+	config, err = parseConfig(data)
 	test.IsNil(t, err)
 	test.IsEqualBool(t, config.UnlimitedTime, true)
 	test.IsEqualBool(t, config.UnlimitedDownload, true)
 
 	data.isE2E = "true"
 	data.realSize = "200"
-	config, err = parseConfig(data, false)
+	config, err = parseConfig(data)
 	test.IsNil(t, err)
 	test.IsEqualBool(t, config.IsEndToEndEncrypted, true)
 	test.IsEqualInt64(t, config.RealSize, 200)
@@ -82,12 +75,12 @@ func TestParseConfig(t *testing.T) {
 
 func TestProcess(t *testing.T) {
 	w, r := test.GetRecorder("POST", "/upload", nil, nil, strings.NewReader("invalid§$%&%§"))
-	err := Process(w, r, false, 20)
+	err := ProcessCompleteFile(w, r, 9, 20)
 	test.IsNotNil(t, err)
 
 	w = httptest.NewRecorder()
 	r = getFileUploadRecorder(false)
-	err = Process(w, r, false, 20)
+	err = ProcessCompleteFile(w, r, 9, 20)
 	test.IsNil(t, err)
 	resp := w.Result()
 	body, _ := io.ReadAll(resp.Body)
@@ -95,27 +88,28 @@ func TestProcess(t *testing.T) {
 	err = json.Unmarshal(body, &result)
 	test.IsNil(t, err)
 	test.IsEqualString(t, result.Result, "OK")
-	test.IsEqualString(t, result.Url, "http://127.0.0.1:53843/d?id=")
-	test.IsEqualString(t, result.HotlinkUrl, "http://127.0.0.1:53843/hotlink/")
+	test.IsEqualString(t, result.FileInfo.UrlDownload, "http://127.0.0.1:53843/d?id="+result.FileInfo.Id)
+	test.IsEqualString(t, result.FileInfo.UrlHotlink, "http://127.0.0.1:53843/downloadFile?id="+result.FileInfo.Id)
 	test.IsEqualString(t, result.FileInfo.Name, "testFile")
 	test.IsEqualString(t, result.FileInfo.Size, "11 B")
 	test.IsEqualBool(t, result.FileInfo.UnlimitedTime, false)
 	test.IsEqualBool(t, result.FileInfo.UnlimitedDownloads, false)
+	test.IsEqualInt(t, result.FileInfo.UploaderId, 9)
 }
 
 func TestProcessNewChunk(t *testing.T) {
 	w, r := test.GetRecorder("POST", "/uploadChunk", nil, nil, strings.NewReader("invalid§$%&%§"))
-	err := ProcessNewChunk(w, r, false)
+	_, err := ProcessNewChunk(w, r, false, "", 100*1000*1000)
 	test.IsNotNil(t, err)
 
 	w = httptest.NewRecorder()
 	r = getFileUploadRecorder(false)
-	err = ProcessNewChunk(w, r, false)
+	_, err = ProcessNewChunk(w, r, false, "", 100*1000*1000)
 	test.IsNotNil(t, err)
 
 	w = httptest.NewRecorder()
 	r = getFileUploadRecorder(true)
-	err = ProcessNewChunk(w, r, false)
+	_, err = ProcessNewChunk(w, r, false, "", 100*1000*1000)
 	test.IsNil(t, err)
 	response, err := io.ReadAll(w.Result().Body)
 	test.IsNil(t, err)
@@ -123,16 +117,28 @@ func TestProcessNewChunk(t *testing.T) {
 }
 
 func TestCompleteChunk(t *testing.T) {
-	w, r := test.GetRecorder("POST", "/uploadComplete", nil, nil, strings.NewReader("invalid§$%&%§"))
-	err := CompleteChunk(w, r, false)
+	body := strings.NewReader("%")
+	r := httptest.NewRequest(http.MethodPost, "/upload", body)
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	_, _, _, err := ParseFileHeader(r)
 	test.IsNotNil(t, err)
 
-	w = httptest.NewRecorder()
+	w := httptest.NewRecorder()
 	r = getFileUploadRecorder(false)
-	err = CompleteChunk(w, r, false)
+	_, _, _, err = ParseFileHeader(r)
 	test.IsNotNil(t, err)
 
 	data := url.Values{}
+	data.Set("isE2E", "true")
+	data.Set("realSize", "none")
+	w, r = test.GetRecorder("POST", "/uploadComplete", nil, nil, strings.NewReader(data.Encode()))
+	r.Header.Set("Content-type", "application/x-www-form-urlencoded")
+	chunkId, header, config, err := ParseFileHeader(r)
+	test.IsNotNil(t, err)
+
+	data.Del("isE2E")
+	data.Del("realSize")
 	data.Set("allowedDownloads", "9")
 	data.Set("expiryDays", "5")
 	data.Set("password", "123")
@@ -141,22 +147,22 @@ func TestCompleteChunk(t *testing.T) {
 	data.Set("filesize", "13")
 	w, r = test.GetRecorder("POST", "/uploadComplete", nil, nil, strings.NewReader(data.Encode()))
 	r.Header.Set("Content-type", "application/x-www-form-urlencoded")
-	err = CompleteChunk(w, r, false)
+	chunkId, header, config, err = ParseFileHeader(r)
 	test.IsNil(t, err)
+	file, err := CompleteChunk(chunkId, header, 9, config)
+	test.IsNil(t, err)
+	test.IsEqualString(t, file.Name, "random.file")
 
-	result := struct {
-		FileInfo models.FileApiOutput `json:"FileInfo"`
-	}{}
 	response, err := io.ReadAll(w.Result().Body)
 	test.IsNil(t, err)
-	err = json.Unmarshal(response, &result)
-	test.IsNil(t, err)
-	test.IsEqualString(t, result.FileInfo.Name, "random.file")
+	test.IsEqualString(t, string(response), "")
 
 	data.Set("chunkid", "invalid")
 	w, r = test.GetRecorder("POST", "/uploadComplete", nil, nil, strings.NewReader(data.Encode()))
 	r.Header.Set("Content-type", "application/x-www-form-urlencoded")
-	err = CompleteChunk(w, r, false)
+	_, _, _, err = ParseFileHeader(r)
+	test.IsNil(t, err)
+	_, err = CompleteChunk(chunkId, header, 9, config)
 	test.IsNotNil(t, err)
 }
 

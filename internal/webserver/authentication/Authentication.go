@@ -1,88 +1,147 @@
 package authentication
 
 import (
-	"crypto/subtle"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/forceu/gokapi/internal/configuration"
-	"github.com/forceu/gokapi/internal/helper"
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/forceu/gokapi/internal/webserver/authentication/sessionmanager"
-	"io"
+	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
+
+	"github.com/forceu/gokapi/internal/configuration"
+	"github.com/forceu/gokapi/internal/configuration/database"
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/forceu/gokapi/internal/webserver/authentication/csrftoken"
+	"github.com/forceu/gokapi/internal/webserver/authentication/sessionmanager"
+	"github.com/forceu/gokapi/internal/webserver/authentication/users"
+	"github.com/forceu/gokapi/internal/webserver/errorHandling"
 )
+
+type userNameContext string
 
 // CookieOauth is the cookie name used for login
 const CookieOauth = "state"
 
-// Internal authentication method uses a user / password combination handled by Gokapi
-const Internal = 0
-
-// OAuth2 authentication retrieves the users email with Open Connect ID
-const OAuth2 = 1
-
-// Header authentication relies on a header from a reverse proxy to parse the username
-const Header = 2
-
-// Disabled authentication ignores all internal authentication procedures. A reverse proxy needs to restrict access
-const Disabled = 3
+const userNameContextKey userNameContext = "userName"
 
 var authSettings models.AuthenticationConfig
 
 // Init needs to be called first to process the authentication configuration
 func Init(config models.AuthenticationConfig) {
+	err := checkAuthConfig(config)
+	if err != nil {
+		log.Println("Error while initiating authentication method:")
+		log.Println(err)
+		osExit(3)
+		return
+	}
 	authSettings = config
 }
 
-// IsAuthenticated returns true if the user provides a valid authentication
-func IsAuthenticated(w http.ResponseWriter, r *http.Request) bool {
-	switch authSettings.Method {
-	case Internal:
-		return isGrantedSession(w, r)
-	case OAuth2:
-		return isGrantedSession(w, r)
-	case Header:
-		return isGrantedHeader(r)
-	case Disabled:
-		return true
+var osExit = os.Exit
+
+// checkAuthConfig checks if the config is actually valid, and returns an error otherwise
+func checkAuthConfig(config models.AuthenticationConfig) error {
+	switch config.Method {
+	case models.AuthenticationInternal:
+		if len(config.Username) < 3 {
+			return errors.New("username too short")
+		}
+		return nil
+	case models.AuthenticationOAuth2:
+		if config.OAuthProvider == "" {
+			return errors.New("oauth provider was not set")
+		}
+		if config.OAuthClientId == "" {
+			return errors.New("oauth client id was not set")
+		}
+		if config.OAuthClientSecret == "" {
+			return errors.New("oauth client secret was not set")
+		}
+		if config.OAuthRecheckInterval < 1 {
+			return errors.New("oauth recheck interval invalid")
+		}
+		return nil
+	case models.AuthenticationHeader:
+		if config.HeaderKey == "" {
+			return errors.New("header key is not set")
+		}
+		return nil
+	case models.AuthenticationDisabled:
+		return nil
+	default:
+		return errors.New("unknown authentication selected")
 	}
-	return false
+}
+
+// GetUserFromRequest returns the user that has been authenticated with the request
+func GetUserFromRequest(r *http.Request) (models.User, error) {
+	c := r.Context()
+	user, ok := c.Value(userNameContextKey).(models.User)
+	if !ok {
+		return models.User{}, errors.New("user not found in context")
+	}
+	return user, nil
+}
+
+// SetUserInRequest saves the user that has been authenticated with the request
+func SetUserInRequest(r *http.Request, user models.User) *http.Request {
+	c := context.WithValue(r.Context(), userNameContextKey, user)
+	return r.WithContext(c)
+}
+
+// IsAuthenticated returns true and the user ID if authenticated
+func IsAuthenticated(w http.ResponseWriter, r *http.Request) (models.User, bool, error) {
+	switch authSettings.Method {
+	case models.AuthenticationInternal:
+		user, ok := isGrantedSession(w, r)
+		if ok {
+			return user, true, nil
+		}
+	case models.AuthenticationOAuth2:
+		user, ok := isGrantedSession(w, r)
+		if ok {
+			return user, true, nil
+		}
+	case models.AuthenticationHeader:
+		user, ok, err := isGrantedHeader(r)
+		if err != nil {
+			return models.User{}, false, err
+		}
+		if ok {
+			return user, true, nil
+		}
+	case models.AuthenticationDisabled:
+		adminUser, ok := database.GetSuperAdmin()
+		if !ok {
+			panic("no super admin found")
+		}
+		return adminUser, true, nil
+	}
+	return models.User{}, false, nil
 }
 
 // isGrantedHeader returns true if the user was authenticated by a proxy header if enabled
-func isGrantedHeader(r *http.Request) bool {
-
+func isGrantedHeader(r *http.Request) (models.User, bool, error) {
 	if authSettings.HeaderKey == "" {
-		return false
+		return models.User{}, false, errors.New("header key is not set")
 	}
-	value := r.Header.Get(authSettings.HeaderKey)
-	if value == "" {
-		return false
+	userName := r.Header.Get(authSettings.HeaderKey)
+	if userName == "" {
+		return models.User{}, false, errors.New("header key is not set or empty")
 	}
-	if len(authSettings.HeaderUsers) == 0 {
-		return true
-	}
-	return isUserInArray(value, authSettings.HeaderUsers)
-}
-
-func isUserInArray(userEntered string, allowedUsers []string) bool {
-	for _, allowedUser := range allowedUsers {
-		matches, err := matchesWithWildcard(strings.ToLower(allowedUser), strings.ToLower(userEntered))
-		helper.Check(err)
-		if matches {
-			return true
-		}
-	}
-	return false
+	return getOrCreateUser(userName)
 }
 
 func matchesWithWildcard(pattern, input string) (bool, error) {
 	components := strings.Split(pattern, "*")
 	if len(components) == 1 {
 		// if len is 1, there are no *'s, return exact match pattern
-		return regexp.MatchString("^"+pattern+"$", input)
+		return strings.ToLower(pattern) == strings.ToLower(input), nil
 	}
 	var result strings.Builder
 	for i, literal := range components {
@@ -129,40 +188,23 @@ func extractOauthGroups(userInfo OAuthUserClaims, groupScope string) ([]string, 
 		return nil, fmt.Errorf("claim %s was not passed on", groupScope)
 	}
 
-	// Convert the interface{} to a []interface{} and then to []string
+	// Handle both string and array cases
 	var groups []string
-	for _, group := range groupsInterface.([]interface{}) {
-		groups = append(groups, group.(string))
+	switch v := groupsInterface.(type) {
+	case string:
+		groups = append(groups, v)
+	case []any:
+		for _, group := range v {
+			groupString, isValid := group.(string)
+			if isValid {
+				groups = append(groups, groupString)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("scope %s is not a valid type", groupScope)
 	}
 
 	return groups, nil
-}
-
-func extractFieldValue(userInfo OAuthUserClaims, fieldName string) (string, error) {
-	var claims json.RawMessage
-
-	err := userInfo.Claims(&claims)
-	if err != nil {
-		return "", err
-	}
-	var fieldMap map[string]interface{}
-	err = json.Unmarshal(claims, &fieldMap)
-	if err != nil {
-		return "", err
-	}
-
-	// Extract the field value based on the provided fieldName
-	fieldValue, ok := fieldMap[fieldName]
-	if !ok {
-		return "", fmt.Errorf("%s scope not found in reply", fieldName)
-	}
-
-	strValue, ok := fieldValue.(string)
-	if !ok {
-		return "", fmt.Errorf("value of %s scope is not a string", fieldName)
-	}
-
-	return strValue, nil
 }
 
 // OAuthUserInfo is used to make testing easier. This results in an additional parameter for the subject unfortunately
@@ -178,87 +220,102 @@ type OAuthUserClaims interface {
 }
 
 // CheckOauthUserAndRedirect checks if the user is allowed to use the Gokapi instance
-func CheckOauthUserAndRedirect(userInfo OAuthUserInfo, w http.ResponseWriter) error {
-	var username string
+func CheckOauthUserAndRedirect(w http.ResponseWriter, r *http.Request, userInfo OAuthUserInfo) error {
 	var groups []string
 	var err error
 
-	if authSettings.OAuthUserScope != "" {
-		if authSettings.OAuthUserScope == "email" {
-			username = userInfo.Email
-		} else {
-			username, err = extractFieldValue(userInfo.ClaimsSent, authSettings.OAuthUserScope)
-			if err != nil {
-				return err
-			}
-		}
-	}
 	if authSettings.OAuthGroupScope != "" {
 		groups, err = extractOauthGroups(userInfo.ClaimsSent, authSettings.OAuthGroupScope)
 		if err != nil {
 			return err
 		}
 	}
-	if isValidOauthUser(userInfo, username, groups) {
-		sessionmanager.CreateSession(w, authSettings.Method == OAuth2, authSettings.OAuthRecheckInterval)
-		redirect(w, "admin")
-		return nil
+	if isValidOauthUser(userInfo, groups) {
+		user, ok, errCreate := getOrCreateUser(userInfo.Email)
+		if errCreate != nil {
+			return errCreate
+		}
+		if ok {
+			sessionmanager.CreateSession(w, true, authSettings.OAuthRecheckInterval, user.Id)
+			http.Redirect(w, r, "admin", http.StatusTemporaryRedirect)
+			return nil
+		}
 	}
-	redirect(w, "error-auth")
+	errorHandling.RedirectGenericErrorPage(w, r, errorHandling.TypeOAuthNotAuthorised)
 	return nil
 }
 
-func isValidOauthUser(userInfo OAuthUserInfo, username string, groups []string) bool {
+func getOrCreateUser(username string) (models.User, bool, error) {
+	user, ok := database.GetUserByName(username)
+	if ok {
+		return user, true, nil
+
+	}
+	if authSettings.OnlyRegisteredUsers {
+		return models.User{}, false, nil
+	}
+	newUser, err := users.Create(username)
+	if err != nil {
+		return models.User{}, false, err
+	}
+	return newUser, true, nil
+}
+
+func isValidOauthUser(userInfo OAuthUserInfo, groups []string) bool {
 	if userInfo.Subject == "" {
 		return false
 	}
-	isValidUser := true
-	if len(authSettings.OAuthUsers) > 0 {
-		isValidUser = isUserInArray(username, authSettings.OAuthUsers)
+	if userInfo.Email == "" {
+		return false
 	}
 	isValidGroup := true
 	if len(authSettings.OAuthGroups) > 0 {
 		isValidGroup = isGroupInArray(groups, authSettings.OAuthGroups)
 	}
-	return isValidUser && isValidGroup
+	return isValidGroup
 }
 
 // isGrantedSession returns true if the user holds a valid internal session cookie
-func isGrantedSession(w http.ResponseWriter, r *http.Request) bool {
-	return sessionmanager.IsValidSession(w, r, authSettings.Method == OAuth2, authSettings.OAuthRecheckInterval)
+func isGrantedSession(w http.ResponseWriter, r *http.Request) (models.User, bool) {
+	return sessionmanager.IsValidSession(w, r, authSettings.Method == models.AuthenticationOAuth2, authSettings.OAuthRecheckInterval)
 }
 
 // IsCorrectUsernameAndPassword checks if a provided username and password is correct
-func IsCorrectUsernameAndPassword(username, password string) bool {
-	return IsEqualStringConstantTime(username, authSettings.Username) &&
-		IsEqualStringConstantTime(configuration.HashPasswordCustomSalt(password, authSettings.SaltAdmin), authSettings.Password)
-}
-
-// IsEqualStringConstantTime uses ConstantTimeCompare to prevent timing attack.
-func IsEqualStringConstantTime(s1, s2 string) bool {
-	return subtle.ConstantTimeCompare(
-		[]byte(strings.ToLower(s1)),
-		[]byte(strings.ToLower(s2))) == 1
-}
-
-// Sends a redirect HTTP output to the client. Variable url is used to redirect to ./url
-func redirect(w http.ResponseWriter, url string) {
-	_, _ = io.WriteString(w, "<html><head><meta http-equiv=\"Refresh\" content=\"0; URL=./"+url+"\"></head></html>")
+// Returns true if the user is authenticated, false otherwise
+// Second return value is false if CSRF token is invalid, true otherwise
+// Migrates legacy passwords to the new format
+func IsCorrectUsernameAndPassword(username, password, userCsrfToken string) (models.User, bool, bool) {
+	if !csrftoken.IsValid(csrftoken.TypeLogin, userCsrfToken) {
+		return models.User{}, false, false
+	}
+	user, ok := database.GetUserByName(username)
+	if !ok {
+		return models.User{}, false, true
+	}
+	isSame, isLegacy := configuration.VerifyPassword(password, user.Password, configuration.Get().Authentication.SaltAdmin)
+	if !isSame {
+		return models.User{}, false, true
+	}
+	if isLegacy {
+		user.Password = configuration.HashPassword(password, false, "")
+		database.SaveUser(user, false)
+	}
+	return user, true, true
 }
 
 // Logout logs the user out and removes the session
 func Logout(w http.ResponseWriter, r *http.Request) {
-	if authSettings.Method == Internal || authSettings.Method == OAuth2 {
+	if authSettings.Method == models.AuthenticationInternal || authSettings.Method == models.AuthenticationOAuth2 {
 		sessionmanager.LogoutSession(w, r)
 	}
-	if authSettings.Method == OAuth2 {
-		redirect(w, "login?consent=true")
+	if authSettings.Method == models.AuthenticationOAuth2 {
+		http.Redirect(w, r, "login?consent=true", http.StatusTemporaryRedirect)
 	} else {
-		redirect(w, "login")
+		http.Redirect(w, r, "login", http.StatusTemporaryRedirect)
 	}
 }
 
 // IsLogoutAvailable returns true if a logout button should be shown with the current form of authentication
 func IsLogoutAvailable() bool {
-	return authSettings.Method == Internal || authSettings.Method == OAuth2
+	return authSettings.Method == models.AuthenticationInternal || authSettings.Method == models.AuthenticationOAuth2
 }

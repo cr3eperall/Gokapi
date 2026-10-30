@@ -1,34 +1,128 @@
-//go:build gogenerate
+//go:build tools
 
 package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
-const versionJsAdmin = "2"
-const versionJsDropzone = "3"
-const versionJsE2EAdmin = "2"
-const versionCssMain = "2"
-
 const fileMain = "../../cmd/gokapi/Main.go"
+const fileApiSpecs = "../../openapi.json"
+const fileMinify = "../../build/go-generate/minifyStaticContent.go"
 const fileVersionConstants = "../../internal/webserver/web/templates/string_constants.tmpl"
+const fileVersionCApi = "../../internal/webserver/api/VersionNumbers.go"
 
 func main() {
 	checkFileExists(fileMain)
+	checkFileExists(fileApiSpecs)
+	checkFileExists(fileMinify)
 	checkFileExists(fileVersionConstants)
-	template := getTemplate()
+	checkFileExists(fileVersionCApi)
+	updateOpenAPIVersion()
+	writeVersionTemplates()
+	writeMinify()
+	writeApiVersion()
+}
+
+func writeVersionTemplates() {
+	template := insertVersionNumbers(templateVersions)
 	err := os.WriteFile(fileVersionConstants, []byte(template), 0664)
 	if err != nil {
-		fmt.Println("FAIL: Updating version numbers")
+		fmt.Println("FAIL: Updating version template")
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	fmt.Println("Updated version numbers")
+	fmt.Println("Updated version template")
+}
+func writeApiVersion() {
+	template := insertVersionNumbers(templateVersionApi)
+	err := os.WriteFile(fileVersionCApi, []byte(template), 0664)
+	if err != nil {
+		fmt.Println("FAIL: Updating version API template")
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	fmt.Println("Updated API version template")
+}
+
+func updateOpenAPIVersion() {
+	input, err := os.ReadFile(fileApiSpecs)
+	if err != nil {
+		fmt.Println("FAIL: Updating version API specs")
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	gokapiVersion := parseGokapiVersion()
+	gokapiVersionInt := parseVersionAsInt(gokapiVersion)
+
+	re := regexp.MustCompile(`("version"\s*:\s*")[^"]+(")`)
+	replacement := []byte(fmt.Sprintf(`${1}%s${2}`, gokapiVersion))
+	output := re.ReplaceAll(input, replacement)
+
+	reSchemaStr := regexp.MustCompile(`(?s)("Version"\s*:\s*\{.*?"example"\s*:\s*")[^"]+(")`)
+	output = reSchemaStr.ReplaceAll(output, []byte(`${1}`+gokapiVersion+`${2}`))
+
+	reSchemaInt := regexp.MustCompile(`(?s)("VersionInt"\s*:\s*\{.*?"example"\s*:\s*)\d+`)
+	output = reSchemaInt.ReplaceAll(output, []byte(`${1}`+gokapiVersionInt))
+
+	err = os.WriteFile(fileApiSpecs, output, 0644)
+	if err != nil {
+		fmt.Println("FAIL: Updating version API specs")
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	fmt.Println("Updated API version in openapi.json")
+}
+
+func writeMinify() {
+	file, err := os.Open(fileMinify)
+	if err != nil {
+		fmt.Println("FAIL: Opening minify go file")
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	foundAutoGencomment := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		lines = append(lines, line)
+		if strings.Contains(line, autoGenComment) {
+			foundAutoGencomment = true
+			break
+		}
+	}
+	err = scanner.Err()
+	if err != nil {
+		fmt.Println("FAIL: Reading minify go file")
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	if !foundAutoGencomment {
+		fmt.Println("FAIL: Minify go file did not contain auto-gen comment")
+		fmt.Println(err)
+		os.Exit(2)
+	}
+	lines = append(lines, insertVersionNumbers(templateMinify))
+
+	err = os.WriteFile(fileMinify, []byte(strings.Join(lines, "\n")), 0664)
+	if err != nil {
+		fmt.Println("FAIL: Writing minify go file")
+		fmt.Println(err)
+		os.Exit(3)
+	}
+	fmt.Println("Updated minify go file")
 }
 
 func checkFileExists(filename string) {
@@ -43,14 +137,42 @@ func checkFileExists(filename string) {
 	}
 }
 
-func getTemplate() string {
+func insertVersionNumbers(input string) string {
 	versionGokapi := parseGokapiVersion()
-	result := strings.ReplaceAll(templateVersions, "%gokapiversion%", versionGokapi)
-	result = strings.ReplaceAll(result, "%jsadmin%", versionJsAdmin)
-	result = strings.ReplaceAll(result, "%jsdropzone%", versionJsDropzone)
-	result = strings.ReplaceAll(result, "%jse2e%", versionJsE2EAdmin)
-	result = strings.ReplaceAll(result, "%css_main%", versionCssMain)
+	hashedVersion := getShortSHA256Hash(versionGokapi)
+	result := strings.ReplaceAll(input, "%gokapiversion%", versionGokapi)
+	result = strings.ReplaceAll(result, "%gokapiversionInt%", parseVersionAsInt(versionGokapi))
+	result = strings.ReplaceAll(result, "%jsadmin%", hashedVersion)
+	result = strings.ReplaceAll(result, "%jsdropzone%", hashedVersion)
+	result = strings.ReplaceAll(result, "%jse2e%", hashedVersion)
+	result = strings.ReplaceAll(result, "%css_main%", hashedVersion)
 	return result
+}
+
+func getShortSHA256Hash(data string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(data))
+	return hex.EncodeToString(hasher.Sum(nil))[:10]
+}
+
+func parseVersionAsInt(version string) string {
+	versionNoAppendix := strings.Split(version, "-")[0]
+	versionSplit := strings.Split(versionNoAppendix, ".")
+	versionMajor := versionSplit[0]
+	versionMinor := versionSplit[1]
+	versionPatch := versionSplit[2]
+	if len(versionMinor) < 2 {
+		versionMinor = "0" + versionMinor
+	}
+	if len(versionPatch) < 2 {
+		versionPatch = "0" + versionPatch
+	}
+	versionInt, err := strconv.Atoi(versionMajor + versionMinor + versionPatch)
+	if err != nil {
+		fmt.Println("ERROR: Cannot parse version number")
+		os.Exit(1)
+	}
+	return strconv.Itoa(versionInt)
 }
 
 func parseGokapiVersion() string {
@@ -76,7 +198,7 @@ func parseGokapiVersion() string {
 	return ""
 }
 
-const templateVersions = `// Change these for rebranding
+const templateVersions = `// File contains auto-generated values. Do not change manually
 {{define "version"}}%gokapiversion%{{end}}
 
 // Specifies the version of JS files, so that the browser doesn't
@@ -85,3 +207,18 @@ const templateVersions = `// Change these for rebranding
 {{define "js_dropzone_version"}}%jsdropzone%{{end}}
 {{define "js_e2eversion"}}%jse2e%{{end}}
 {{define "css_main"}}%css_main%{{end}}`
+
+const autoGenComment = "// Auto-generated content below, do not modify"
+const templateMinify = `// Version codes can be changed in updateVersionNumbers.go
+
+const jsAdminVersion = "%jsadmin%"
+const jsE2EVersion = "%jse2e%"
+const cssMainVersion = "%css_main%"
+`
+
+const templateVersionApi = `// Code generated by updateApiRouting.go - DO NOT EDIT.
+package api
+
+const versionReadable = "%gokapiversion%"
+const versionInt = %gokapiversionInt%
+`

@@ -2,8 +2,9 @@ package models
 
 import (
 	"errors"
-	"github.com/forceu/gokapi/internal/test"
 	"testing"
+
+	"github.com/forceu/gokapi/internal/test"
 )
 
 func TestToJsonResult(t *testing.T) {
@@ -13,13 +14,14 @@ func TestToJsonResult(t *testing.T) {
 		Size:               "10 B",
 		SizeBytes:          10,
 		SHA1:               "sha256",
-		ExpireAt:           50,
-		ExpireAtString:     "future",
+		ExpireAt:           1750852108,
 		DownloadsRemaining: 1,
 		PasswordHash:       "pwhash",
 		HotlinkId:          "hotlinkid",
 		ContentType:        "text/html",
 		AwsBucket:          "test",
+		UploadDate:         1748180908,
+		UserId:             2,
 		DownloadCount:      3,
 		Encryption: EncryptionInfo{
 			IsEncrypted:   true,
@@ -28,8 +30,10 @@ func TestToJsonResult(t *testing.T) {
 		},
 		UnlimitedDownloads: true,
 		UnlimitedTime:      true,
+		PendingDeletion:    100,
 	}
-	test.IsEqualString(t, file.ToJsonResult("serverurl/"), `{"Result":"OK","FileInfo":{"Id":"testId","Name":"testName","Size":"10 B","HotlinkId":"hotlinkid","ContentType":"text/html","ExpireAt":50,"SizeBytes":10,"ExpireAtString":"future","DownloadsRemaining":1,"DownloadCount":3,"UnlimitedDownloads":true,"UnlimitedTime":true,"RequiresClientSideDecryption":true,"IsEncrypted":true,"IsPasswordProtected":true,"IsSavedOnLocalStorage":false},"Url":"serverurl/d?id=","HotlinkUrl":"serverurl/hotlink/","GenericHotlinkUrl":"serverurl/downloadFile?id="}`)
+	test.IsEqualString(t, file.ToJsonResult("serverurl/", false), `{"Result":"OK","FileInfo":{"Id":"testId","Name":"testName","Size":"10 B","HotlinkId":"hotlinkid","ContentType":"text/html","ExpireAtString":"2025-06-25 11:48:28","UrlDownload":"serverurl/d?id=testId","UrlHotlink":"","FileRequestId":"","UploadDate":1748180908,"ExpireAt":1750852108,"SizeBytes":10,"DownloadsRemaining":1,"DownloadCount":3,"UnlimitedDownloads":true,"UnlimitedTime":true,"RequiresClientSideDecryption":true,"IsEncrypted":true,"IsEndToEndEncrypted":false,"IsPasswordProtected":true,"IsSavedOnLocalStorage":false,"IsPendingDeletion":true,"IsFileRequest":false,"UploaderId":2},"IncludeFilename":false}`)
+	test.IsEqualString(t, file.ToJsonResult("serverurl/", true), `{"Result":"OK","FileInfo":{"Id":"testId","Name":"testName","Size":"10 B","HotlinkId":"hotlinkid","ContentType":"text/html","ExpireAtString":"2025-06-25 11:48:28","UrlDownload":"serverurl/d/testId/testName","UrlHotlink":"","FileRequestId":"","UploadDate":1748180908,"ExpireAt":1750852108,"SizeBytes":10,"DownloadsRemaining":1,"DownloadCount":3,"UnlimitedDownloads":true,"UnlimitedTime":true,"RequiresClientSideDecryption":true,"IsEncrypted":true,"IsEndToEndEncrypted":false,"IsPasswordProtected":true,"IsSavedOnLocalStorage":false,"IsPendingDeletion":true,"IsFileRequest":false,"UploaderId":2},"IncludeFilename":true}`)
 }
 
 func TestIsLocalStorage(t *testing.T) {
@@ -59,4 +63,24 @@ func TestRequiresClientDecryption(t *testing.T) {
 	test.IsEqualBool(t, file.RequiresClientDecryption(), false)
 	file.Encryption.IsEncrypted = true
 	test.IsEqualBool(t, file.RequiresClientDecryption(), false)
+}
+
+func TestGetHolinkUrl(t *testing.T) {
+	file := FileApiOutput{
+		Id:                           "testfile",
+		Name:                         "name",
+		Size:                         "1 B",
+		HotlinkId:                    "test",
+		RequiresClientSideDecryption: true,
+	}
+	url := getHotlinkUrl(file, "testserver/", false)
+	test.IsEqualString(t, url, "")
+	file.RequiresClientSideDecryption = false
+	url = getHotlinkUrl(file, "testserver/", false)
+	test.IsEqualString(t, url, "testserver/h/test")
+	file.HotlinkId = ""
+	url = getHotlinkUrl(file, "testserver/", false)
+	test.IsEqualString(t, url, "testserver/downloadFile?id=testfile")
+	url = getHotlinkUrl(file, "testserver/", true)
+	test.IsEqualString(t, url, "testserver/dh/testfile/name")
 }

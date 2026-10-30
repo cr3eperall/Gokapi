@@ -8,14 +8,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/forceu/gokapi/internal/helper"
-	"github.com/forceu/gokapi/internal/models"
-	"github.com/secure-io/sio-go"
-	"golang.org/x/crypto/scrypt"
 	"io"
 	"log"
 	"os"
 	"time"
+
+	"github.com/forceu/gokapi/internal/helper"
+	"github.com/forceu/gokapi/internal/models"
+	"github.com/secure-io/sio-go"
+	"golang.org/x/crypto/scrypt"
 )
 
 // NoEncryption means all files are stored in plaintext
@@ -38,6 +39,12 @@ const EndToEndEncryption = 5
 
 var encryptedKey, ramCipher []byte
 
+// IsDecryptionAvailable returns true if the master encryption key has been
+// loaded into memory, meaning server-side decryption is possible.
+func IsDecryptionAvailable() bool {
+	return len(ramCipher) > 0
+}
+
 const blockSize = 32
 const nonceSize = 12
 
@@ -46,13 +53,9 @@ func Init(config models.Configuration) {
 	switch config.Encryption.Level {
 	case NoEncryption:
 		return
-	case LocalEncryptionStored:
-		fallthrough
-	case FullEncryptionStored:
+	case LocalEncryptionStored, FullEncryptionStored:
 		initWithCipher(config.Encryption.Cipher)
-	case LocalEncryptionInput:
-		fallthrough
-	case FullEncryptionInput:
+	case LocalEncryptionInput, FullEncryptionInput:
 		initWithPassword(config.Encryption.Salt, config.Encryption.Checksum, config.Encryption.ChecksumSalt)
 	case EndToEndEncryption:
 		return
@@ -176,7 +179,7 @@ func DecryptReader(encInfo models.EncryptionInfo, input io.Reader, output io.Wri
 	return err
 }
 
-// IsCorrectKey checks if correct key is being used. This does not check for complete file authentication.
+// IsCorrectKey checks if the correct key is being used. This does not check for complete file authentication.
 func IsCorrectKey(encInfo models.EncryptionInfo, input *os.File) bool {
 	_, err := createDecryptReader(encInfo, input)
 	if err != nil {
@@ -258,9 +261,6 @@ func getStream(cipherKey []byte) *sio.Stream {
 		log.Fatal(err)
 	}
 	stream := sio.NewStream(gcm, sio.BufSize)
-	if err != nil {
-		log.Fatal(err)
-	}
 	return stream
 }
 

@@ -1,5 +1,4 @@
-{{ define "admin" }}
-{{ template "header" . }}
+{{ define "admin" }}{{ template "header" . }}
  
       <div class="row">
         <div class="col">
@@ -7,45 +6,92 @@
 		  <div class="card-body">
 		    <h3 class="card-title">Upload</h3>
 		    <br>
-		    <p class="card-text"><form action="./uploadChunk"
-			      class="dropzone"
-			      id="uploaddropzone"></form>	
+		    <p class="card-text">
+		    
+			<form action="./uploadChunk" class="dropzone upload-box text-center w-100" id="uploaddropzone">
+				<div class="dz-message">
+{{ if .EndToEndEncryption }}
+				    <p id="uploadBoxTitle" class="mb-2 fs-5">Please wait</p>
+				    <p id="uploadBoxSubtitle" class="mb-0 opacity-75">Loading end-to-end encryption...</p>
+{{ else }}
+				    <p id="uploadBoxTitle" class="mb-2 fs-5">Drag & drop files here</p>
+				    <p id="uploadBoxSubtitle" class="mb-0 opacity-75">or paste or click to select.</p>
+{{ end }}
+				</div>
+			</form>
 		
 		<div id="uploadstatus" class="container uploads-container">
 		</div>		
 		<p></p>
 		
 		<br>
-		<div class="container-md">
-		  <div class="row">
-			  <div class="form-group col">
-				<input class="form-check-input" type="checkbox" name="enableDownloadLimit" id="enableDownloadLimit" onchange="checkBoxChanged(this, 'allowedDownloads')" value="" aria-label="Enable Download Limit" {{ if not .DefaultUnlimitedDownload }} checked {{ end }}>
-	     			<label class="control-label small" for="allowedDownloads">Limit Downloads</label>
-				<div class="input-group mb-3">
-					<input type="number" class="form-control admin-input" value="{{ .DefaultDownloads }}" name="allowedDownloads" id="allowedDownloads" min="1"  {{ if .DefaultUnlimitedDownload }} disabled {{ end }}  style="text-align: right;">
-	  				<span class="input-group-text">Downloads</span>
-				</div>
-			 </div>
-  			 <div class="break"></div>
-	   		 <div class="form-group col">
-				<input class="form-check-input" type="checkbox" name="enableTimeLimit" id="enableTimeLimit" onchange="checkBoxChanged(this, 'expiryDays')" value="" aria-label="Enable Time Limit"  {{ if not .DefaultUnlimitedTime }} checked {{ end }}>
-	     			<label class="control-label  small" for="expiryDays">Expiry</label>
-				<div class="input-group mb-3">
-					<input type="number" class="form-control admin-input" value="{{ .DefaultExpiry }}" name="expiryDays" id="expiryDays" min="1"  {{ if .DefaultUnlimitedTime }} disabled {{ end }} style="text-align: right;">
-	  				<span class="input-group-text">Days</span>
-				</div>
-			 </div>
-  			 <div class="break"></div>
-	    		 <div class="form-group col">
-				<input class="form-check-input" type="checkbox" name="enablePassword" id="enablePassword" onchange="checkBoxChanged(this, 'password')" value="" aria-label="Enable Password Protection" {{ if ne .DefaultPassword "" }} checked {{ end }}>
-	     			<label class="control-label  small" for="password">Password</label>
-				<input class="form-control admin-input" value="{{ .DefaultPassword }}" name="password" id="password" placeholder="None" {{ if eq .DefaultPassword "" }} disabled {{ end }}>
-			  </div>
+		<div class="upload-options-grid">
+
+
+		  <div class="upload-option-card">
+		    <div class="upload-option-header">
+		      <div class="d-flex align-items-center gap-2">
+		        <i class="bi bi-arrow-down-circle upload-option-icon"></i>
+		        <span class="upload-option-label">Download Limit</span>
+		      </div>
+		      <div class="form-check form-switch mb-0">
+		        <input class="form-check-input upload-option-toggle" type="checkbox" role="switch"
+		               name="enableDownloadLimit" id="enableDownloadLimit"
+		               onchange="checkBoxChanged(this, 'allowedDownloads')" checked
+		               aria-label="Enable Download Limit">
+		      </div>
+		    </div>
+		    <div class="input-group upload-option-input-group">
+		      <input type="number" class="form-control admin-input" value="1"
+		             name="allowedDownloads" id="allowedDownloads" min="1"
+		             style="text-align: right;" data-allow-regular-paste>
+		      <span class="input-group-text upload-option-suffix">Downloads</span>
+		    </div>
+		  </div>
+
+		  <div class="upload-option-card">
+		    <div class="upload-option-header">
+		      <div class="d-flex align-items-center gap-2">
+		        <i class="bi bi-calendar-x upload-option-icon"></i>
+		        <span class="upload-option-label">Expiry</span>
+		      </div>
+		      <div class="form-check form-switch mb-0">
+		        <input class="form-check-input upload-option-toggle" type="checkbox" role="switch"
+		               name="enableTimeLimit" id="enableTimeLimit"
+		               onchange="checkBoxChanged(this, 'expiryDays')" checked
+		               aria-label="Enable Time Limit">
+		      </div>
+		    </div>
+		    <div class="input-group upload-option-input-group">
+		      <input type="number" class="form-control admin-input" value="14"
+		             name="expiryDays" id="expiryDays" min="1" max="100000"
+		             style="text-align: right;" data-allow-regular-paste>
+		      <span class="input-group-text upload-option-suffix">Days</span>
+		    </div>
+		  </div>
+
+		  <div class="upload-option-card">
+		    <div class="upload-option-header">
+		      <div class="d-flex align-items-center gap-2">
+		        <i class="bi bi-key upload-option-icon"></i>
+		        <span class="upload-option-label">Password</span>
+		      </div>
+		      <div class="form-check form-switch mb-0">
+		        <input class="form-check-input upload-option-toggle" type="checkbox" role="switch"
+		               name="enablePassword" id="enablePassword"
+		               onchange="checkBoxChanged(this, 'password')"
+		               aria-label="Enable Password Protection">
+		      </div>
+		    </div>
+		    <input class="form-control admin-input upload-option-input-group" value=""
+		           name="password" id="password" placeholder="No password" disabled
+		           data-allow-regular-paste>
+		  </div>
+
+		</div>
 <div id="errordiv" class="alert alert-danger" style="display:none">
   <span id="errormessage" ></span>
 </div>
-		  </div>
-		</div>
 		<br><br>
 		<div class="table-responsive">
 			<table id="maintable" class="table table-dark">
@@ -62,37 +108,39 @@
 				</thead>
 				<tbody id="downloadtable">
 {{ range .Items }}
-	{{ if  or (gt .ExpireAt $.TimeNow) (.UnlimitedTime) }}
-		{{ if or (gt .DownloadsRemaining 0) (.UnlimitedDownloads) }}
-					<tr>
+	{{ if not (or .IsPendingDeletion .IsFileRequest) }}	
+		{{ if  or (gt .ExpireAt $.TimeNow) (.UnlimitedTime) }}
+			{{ if or (gt .DownloadsRemaining 0) (.UnlimitedDownloads) }}
+					<tr id="row-{{ .Id }}">
 						<td id="cell-name-{{ .Id }}">{{ .Name }}</td>
 						<td data-order="{{ .SizeBytes }}">{{ .Size }}</td>
-			{{ if .UnlimitedDownloads }}
+				{{ if .UnlimitedDownloads }}
 						<td>Unlimited</td>
-			{{ else }}
-						<td>{{ .DownloadsRemaining }}</td>
-			{{ end }}
-			{{ if .UnlimitedTime }}
-						<td>Unlimited</td>
-			{{ else }}
-						<td>{{ .ExpireAtString }}</td>
-			{{ end }}
-						<td>{{ .DownloadCount }}</td>
-						<td><a id="url-href-{{ .Id }}" target="_blank" href="{{ $.Url }}{{ .Id }}">{{ .Id }}</a>{{ if .IsPasswordProtected }}  <i title="Password protected" class="bi bi-key"></i>{{ end }}</td>
-						<td><button id="url-button-{{ .Id }}" type="button" onclick="showToast()" data-clipboard-text="{{ $.Url }}{{ .Id }}" class="copyurl btn btn-outline-light btn-sm"><i class="bi bi-copy"></i> URL</button> 
-			{{ if ne .HotlinkId "" }}
- 						<button type="button" onclick="showToast()" data-clipboard-text="{{ $.HotlinkUrl }}{{ .HotlinkId }}" class="copyurl btn btn-outline-light btn-sm"><i class="bi bi-copy"></i> Hotlink</button>
-			{{ else }}
-				{{ if or (.IsPasswordProtected) (.RequiresClientSideDecryption)  }}
-	 						<button type="button"class="copyurl btn btn-outline-light btn-sm disabled"><i class="bi bi-copy"></i> Hotlink</button>
 				{{ else }}
- 							<button type="button" onclick="showToast()" data-clipboard-text="{{ $.GenericHotlinkUrl }}{{ .Id }}" class="copyurl btn btn-outline-light btn-sm"><i class="bi bi-copy"></i> Hotlink</button>
+						<td id="cell-downloadsRemaining-{{ .Id }}">{{ .DownloadsRemaining }}</td>
 				{{ end }}
-			{{ end }}
-						<button type="button" title="QR Code" class="btn btn-outline-light btn-sm" onclick="showQrCode('{{ $.Url }}{{ .Id }}');"><i class="bi bi-qr-code"></i></button>
-						<button type="button" title="Edit" class="btn btn-outline-light btn-sm" onclick="showEditModal('{{.Name }}','{{.Id}}', {{.DownloadsRemaining }}, {{.ExpireAt }}, {{.IsPasswordProtected}}, {{.UnlimitedDownloads }}, {{.UnlimitedTime}});"><i class="bi bi-pencil"></i></button>
-						<button type="button" title="Delete" class="btn btn-outline-danger btn-sm" onclick="window.location='./delete?id={{ .Id }}'"><i class="bi bi-trash3"></i></button></td>
+				{{ if .UnlimitedTime }}
+						<td>Unlimited</td>
+				{{ else }}
+						<td><span id="cell-expireatstring-{{ .Id }}"></span></td>
+						 <script>insertFormattedDate({{ .ExpireAt }}, "cell-expireatstring-{{ .Id }}");</script>
+				{{ end }}
+						<td id="cell-downloads-{{ .Id }}">{{ .DownloadCount }}</td>
+						<td><a id="url-href-{{ .Id }}" target="_blank" href="{{ .UrlDownload }}">{{ .Id }}</a>{{ if .IsPasswordProtected }}  <i title="Password protected" class="bi bi-key"></i>{{ end }}</td>
+						<td>
+						<div class="btn-toolbar justify-content-end" role="toolbar" >
+						  <div class="btn-group me-2" role="group">
+						     {{ template "admin_button_copyurl" (newAdminButtonContext . $.ActiveUser)}}
+						     {{ template "admin_button_share" (newAdminButtonContext . $.ActiveUser)}}
+						  </div>
+						  <div class="btn-group" role="group">
+						     {{ template "admin_button_download" (newAdminButtonContext . $.ActiveUser) }}
+						     {{ template "admin_button_edit" (newAdminButtonContext . $.ActiveUser) }}
+						     {{ template "admin_button_delete" (newAdminButtonContext . $.ActiveUser) }}
+						 </div>
+						</div></td>
 					</tr>
+			{{ end }}
 		{{ end }}
 	{{ end }}
 {{ end }}
@@ -104,9 +152,177 @@
 	    </div>
    	 </div>
 	
-	<!-- Modal for editing-->
+	{{ template "admin_modal_edit" }}
+	
+
+	<div id="toastnotification" class="toastnotification" data-default="URL copied to clipboard">Toast Text</div>
+	<div id="toastnotificationUndo" class="toastnotification">
+	  File deleted: <span id="toastFilename"></span>
+  	   <span id="toastUndoButton" class="toast-undo" onclick="handleUndo(this)">Restore</span>
+	</div>
+	<div id="toastDeprecation" class="toastnotification toastdeprecation">
+	  Warning! This server is using a deprecated feature. Detailed information can be found in the system logs.
+	</div>
+	<div id="qroverlay">
+	  <div id="qrcode"></div>
+	</div>
+
+	<script src="./js/min/admin.min.{{ template "js_admin_version"}}.js"></script>
+	<script>
+	
+	initDropzone();
+
+	Dropzone.options.uploaddropzone["maxFilesize"] = {{ .MaxFileSize }};
+	Dropzone.options.uploaddropzone["timeout"] = 1200000;
+	Dropzone.options.uploaddropzone["chunking"] = true;
+	Dropzone.options.uploaddropzone["chunkSize"] = {{ .ChunkSize }} * 1024 * 1024;
+	Dropzone.options.uploaddropzone["parallelUploads"] = 1;
+	Dropzone.options.uploaddropzone["parallelChunkUploads"] = {{.MaxParallelUploads}};
+	Dropzone.options.uploaddropzone["forceChunking"] = true;
+	Dropzone.options.uploaddropzone["retryChunksLimit"] = 3;
+	Dropzone.options.uploaddropzone["retryChunks"] = true;
+	Dropzone.options.uploaddropzone["previewsContainer"] = false;
+	
+	$(document).ready(function () {
+	
+	    $('#maintable').DataTable({
+	    "responsive": true,
+	    "order": [], // disables initial sorting
+	    "columnDefs": [ {
+		"targets": 6,
+		"orderable": false
+		} ],
+	    "paging": false,
+	    "language": {
+	      "info": "Files stored: _TOTAL_",
+	      "emptyTable": "No files stored yet",
+	      "infoEmpty": "",
+	    }
+	    });
+	});
+	
+	registerChangeHandler();
+		
+	var canReplaceOwnFiles = {{.ActiveUser.HasPermissionReplace}};
+	setUploadDefaults();
+	
+{{ if .ShowDeprecationNotice }}
+	showDeprecationNotice();
+{{ end }}
+	
+	</script>
+        <script src="./js/min/uuid.min.js"></script>
+
+{{ if .EndToEndEncryption }}
+        <script src="./js/min/wasm_exec.min.js"></script>
+	<script src="./js/min/end2end_admin.min.{{ template "js_e2eversion"}}.js"></script>
+	<script>
+	{{ if .IncludeFilename }} 
+		const IncludeFilename = true;
+	{{ else }}
+		const IncludeFilename = false;
+	{{ end }}
+		isE2EEnabled = true;
+	
+		Blob.prototype.arrayBuffer ??= function() {
+		    return new Response(this).arrayBuffer()
+		}
+		
+		checkIfE2EKeyIsSet();
+	</script>
+{{ end }}
+        
+        
+{{ template "pagename" "FileRequest"}}
+{{ template "customjs" .}}
+
+
+{{ template "footer" true}}
+{{ end }}
+
+
+
+{{ define "admin_button_download" }}
+			<button
+			    type="button"
+			    title="Download"
+			    class="btn btn-outline-light btn-sm {{if .CurrentFile.RequiresClientSideDecryption}}disabled{{end}}"
+			    onclick="downloadFileWithPresign('{{.CurrentFile.Id }}');">
+		   	    <i class="bi bi-download"></i>
+			</button>
+
+{{ end }}
+
+{{ define "admin_button_edit" }}
+			<button
+			    type="button"
+			    title="Edit"
+			    {{ if and (ne .ActiveUser.Id .CurrentFile.UploaderId) (not .ActiveUser.HasPermissionEditOtherUploads) }}
+			    	disabled
+			    {{ end }}
+			    class="btn btn-outline-light btn-sm"
+			    onclick="showEditModal('{{.CurrentFile.Name }}',
+			    	'{{.CurrentFile.Id}}', {{.CurrentFile.DownloadsRemaining }},
+			    	 {{.CurrentFile.ExpireAt }}, {{.CurrentFile.IsPasswordProtected}},
+			    	 {{.CurrentFile.UnlimitedDownloads }}, {{.CurrentFile.UnlimitedTime}},
+			    	 {{.CurrentFile.IsEndToEndEncrypted}},
+			    	 {{ or (and (eq .ActiveUser.Id .CurrentFile.UploaderId) (.ActiveUser.HasPermissionReplace))
+			    	 	(.ActiveUser.HasPermissionReplaceOtherUploads) }});">
+		   	    <i class="bi bi-pencil"></i>
+			</button>
+
+{{ end }}
+
+
+{{ define "admin_button_delete" }}
+			<button id="button-delete-{{ .CurrentFile.Id}}"
+			   type="button"
+			   title="Delete"
+			    {{ if and (ne .ActiveUser.Id .CurrentFile.UploaderId) (not .ActiveUser.HasPermissionDeleteOtherUploads) }}
+			    	disabled
+			    {{ end }}
+			   class="btn btn-outline-danger btn-sm"
+			   onclick="deleteFile('{{ .CurrentFile.Id }}')">
+			   <i class="bi bi-trash3"></i>
+			</button>
+{{ end }}
+
+{{ define "admin_button_copyurl" }}
+		    <button id="url-button-{{ .CurrentFile.Id }}" type="button" onclick="showToast(1000)"
+		    	data-clipboard-text="{{ .CurrentFile.UrlDownload }}" class="copyurl btn btn-outline-light btn-sm" title="Copy URL"><i class="bi bi-copy"></i> URL</button>
+		    <button type="button" class="btn btn-outline-light btn-sm dropdown-toggle dropdown-toggle-split" data-bs-toggle="dropdown" aria-expanded="false">
+		    </button>
+			<ul class="dropdown-menu dropdown-menu-end" data-bs-theme="dark" >
+	{{ if ne .CurrentFile.UrlHotlink "" }}
+			    <li style="cursor: pointer;"><a class="dropdown-item copyurl" title="Copy hotlink" onclick="showToast(1000)"
+			    	data-clipboard-text="{{ .CurrentFile.UrlHotlink }}"><i class="bi bi-copy"></i> Hotlink</a></li>
+		{{ else }}
+			    <li><a class="dropdown-item disabled">Hotlink not available</a></li>
+	{{ end }}
+			</ul>
+{{ end }}
+
+{{ define "admin_button_share" }}
+		    <button type="button" class="btn btn-outline-light btn-sm" title="Share" onclick="shareUrl(event, '{{ .CurrentFile.Id }}',
+		       '{{ .CurrentFile.UrlDownload }}')">
+		       <!-- For some reason bi-share does not always show up, using the svg fixes it -->
+		       	<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi" viewBox="0 0 16 16">
+ 				 <path d="M13.5 1a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3M11 2.5a2.5 2.5 0 1 1 .603 1.628l-6.718 3.12a2.5 2.5 0 0 1 0 1.504l6.718 3.12a2.5 2.5 0 1 1-.488.876l-6.718-3.12a2.5 2.5 0 1 1 0-3.256l6.718-3.12A2.5 2.5 0 0 1 11 2.5m-8.5 4a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3m11 5.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3"/>
+			</svg>
+</button>
+		    <button type="button" id="shareDropdown-{{ .CurrentFile.Id }}" class="btn btn-outline-light btn-sm dropdown-toggle dropdown-toggle-split" data-bs-toggle="dropdown" aria-expanded="false">
+		    </button>
+			<ul class="dropdown-menu dropdown-menu-end" data-bs-theme="dark" >
+			    <li style="cursor: pointer;"><a class="dropdown-item" id="qrcode-{{ .CurrentFile.Id }}" title="Open QR Code" onclick="showQrCode('{{ .CurrentFile.UrlDownload }}');"><i class="bi bi-qr-code"></i> QR Code</a></li>
+			    <li style="cursor: pointer;"><a class="dropdown-item" id="email-{{ .CurrentFile.Id }}" href="mailto:?body={{ .CurrentFile.UrlDownload | urlquery}}"
+			       target="_blank" title="Share via email"><i class="bi bi-envelope"></i> Email</a></li>
+			</ul>
+{{ end }}
+
+{{ define "admin_modal_edit" }}
+
 	<div class="modal fade" id="modaledit" tabindex="-1" aria-labelledby="m_filenamelabel" aria-hidden="true">
-	  <div class="modal-dialog gokapi-dialog">
+	  <div class="modal-dialog  modal-lg gokapi-dialog">
 	    <div class="modal-content gokapi-dialog">
 	      <div class="modal-header">
 		<h1 class="modal-title fs-5" id="m_filenamelabel">Filename</h1>
@@ -116,79 +332,39 @@
 		  <div class="input-group-text">
       			<input type="checkbox" id="mc_download"  checked aria-label="Limit downloads" title="Limit downloads"  data-toggle-target="mi_edit_down" onchange="handleEditCheckboxChange(this)">
    		 </div>
-		  <span class="input-group-text" id="edit_down">Limit Downloads</span>
-		  <input type="number" min="1" id="mi_edit_down" class="form-control" aria-label="Downloads Remaining" aria-describedby="edit_down">
+		  <span class="input-group-text modal-samesize-input-edit" id="edit_down">Limit Downloads</span>
+		  <input type="number" min="1" id="mi_edit_down" class="form-control" aria-label="Downloads Remaining" aria-describedby="edit_down" data-allow-regular-paste>
 		</div>
 		<div class="input-group mb-3">
 		  <div class="input-group-text">
-      			<input id="mc_expiry" type="checkbox" checked aria-label="Expire files" title="Expire files"  data-toggle-target="mi_edit_expiry" data-timestamp="" onchange="handleEditCheckboxChange(this)">
+      			<input id="mc_expiry" type="checkbox" checked aria-label="Expire files" title="Expire files"  data-toggle-target="mi_edit_expiry" data-timestamp="" onchange="handleEditCheckboxChange(this)" >
    		 </div>
-		  <span class="input-group-text" id="edit_expdate">Expiry&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>
-		  <input type="text" id="mi_edit_expiry" class="form-control" aria-label="Expiry" aria-describedby="edit_expdate">
+		  <span class="input-group-text modal-samesize-input-edit" id="edit_expdate">Expiry</span>
+		  <input type="text" id="mi_edit_expiry" class="form-control" aria-label="Expiry" aria-describedby="edit_expdate"  data-allow-regular-paste>
 		</div>
 		<div class="input-group mb-3">
 		  <div class="input-group-text">
       			<input type="checkbox" id="mc_password" aria-label="Require password" title="Require password" data-toggle-target="mi_edit_pw" onchange="handleEditCheckboxChange(this)">
    		 </div>
-		  <span class="input-group-text" id="edit_pw">Password&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>
-		  <input type="text" id="mi_edit_pw" class="form-control" aria-label="Password" disabled onclick="selectTextForPw(this)" aria-describedby="edit_pw">
+		  <span class="input-group-text modal-samesize-input-edit" id="edit_pw">Password</span>
+		  <input type="text" id="mi_edit_pw" class="form-control" aria-label="Password" disabled onclick="selectTextForPw(this)" aria-describedby="edit_pw"  data-allow-regular-paste>
+		</div>
+		
+	      <div class="input-group mb-3" id="replaceGroup">
+		  <div class="input-group-text">
+		    <input type="checkbox" id="mc_replace" aria-label="Replace file content" title="Replace file content" data-toggle-target="mi_edit_replace" onchange="handleEditCheckboxChange(this)">
+		  </div>
+		  <span class="input-group-text modal-samesize-input-edit" id="edit_replace">Replace Content</span>
+		  <select id="mi_edit_replace" class="form-select" aria-label="Replace File Content" disabled>
+		  </select>
 		</div>
 	      </div>
 	      <div class="modal-footer">
-		<button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">Close</button>
+		<button type="button" class="btn btn-outline-light"  aria-label="Close" data-bs-dismiss="modal">Close</button>
 		<button type="button" class="btn btn-primary" data-fileid="" id="mb_save" onclick="editFile();">Save changes</button>
 	      </div>
 	    </div>
 	  </div>
 	</div>
-	
-	
 
-
-	<div id="toastnotification" class="toastnotification">URL copied to clipboard</div>
-	<div id="qroverlay">
-	  <div id="qrcode"></div>
-	</div>
-
-	<script src="./js/min/admin.min.js?v={{ template "js_admin_version"}}"></script>
-	<script>
-		Dropzone.options.uploaddropzone["maxFilesize"] = {{ .MaxFileSize }};
-		Dropzone.options.uploaddropzone["timeout"] = 1200000;
-		Dropzone.options.uploaddropzone["chunking"] = true;
-		Dropzone.options.uploaddropzone["chunkSize"] = 10000000;
-		Dropzone.options.uploaddropzone["forceChunking"] = true;
-		Dropzone.options.uploaddropzone["retryChunksLimit"] = 3;
-		Dropzone.options.uploaddropzone["retryChunks"] = true;
-		Dropzone.options.uploaddropzone["previewsContainer"] = false;
-		
-		$(document).ready(function () {
-		
-		    $('#maintable').DataTable({
-    		    "responsive": true,
-		    "columnDefs": [ {
-			"targets": 6,
-			"orderable": false
-			} ],
-		    "paging": false,
-		    "language": {
-		      "info": "Files stored: _TOTAL_",
-		      "emptyTable": "No files stored yet",
-		      "infoEmpty": "",
-		    }
-		    });
-		});
-		registerChangeHandler();
-	</script>
-
-{{ if .EndToEndEncryption }}
-        <script src="./js/min/wasm_exec.min.js"></script>
-	<script src="./js/min/end2end_admin.min.js?v={{ template "js_e2eversion"}}"></script>
-	<script>
-		checkIfE2EKeyIsSet();
-	</script>
-{{ end }}
-        
-
-
-{{ template "footer" }}
 {{ end }}
