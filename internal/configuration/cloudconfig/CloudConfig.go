@@ -65,14 +65,6 @@ func Delete() error {
 
 func loadFromEnv(env *environment.Environment) CloudConfig {
 	return CloudConfig{Aws: models.AwsConfig{
-<<<<<<< HEAD
-		Bucket:    	env.AwsBucket,
-		Region:    	env.AwsRegion,
-		Endpoint:  	env.AwsEndpoint,
-		KeyId:     	env.AwsKeyId,
-		KeySecret: 	env.AwsKeySecret,
-		Expiration: env.AwsExpiration,
-=======
 		Bucket:        env.AwsBucket,
 		Region:        env.AwsRegion,
 		Endpoint:      env.AwsEndpoint,
@@ -80,7 +72,6 @@ func loadFromEnv(env *environment.Environment) CloudConfig {
 		KeySecret:     env.AwsKeySecret,
 		ProxyDownload: env.AwsProxyDownload,
 		Expiration:    env.AwsExpiration,
->>>>>>> Forceu-master
 	}}
 }
 
