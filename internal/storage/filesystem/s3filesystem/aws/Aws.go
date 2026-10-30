@@ -176,7 +176,13 @@ func getPresignedUrl(file models.File, forceDownload bool) (string, error) {
 		ResponseContentType:        aws.String(file.ContentType),
 	})
 
-	url, err := req.Presign(15 * time.Second)
+	return req.Presign(time.Duration(awsConfig.Expiration) * time.Second)
+}
+
+// redirectToDownload creates a presigned link that is valid for 15 seconds and redirects the
+// client to this url
+func redirectToDownload(w http.ResponseWriter, r *http.Request, file models.File, forceDownload bool) error {
+	url, err := getPresignedUrl(file, forceDownload)
 	if err != nil {
 		return err
 	}
