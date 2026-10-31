@@ -477,10 +477,6 @@
 							<div class="col-sm-8">
 							  <label for="s3_endpoint">Endpoint:</label>
 								<input type="text" class="form-control" id="s3_endpoint" name="s3_endpoint" placeholder="Endpoint (leave blank if AWS S3)">
-							</div><br><br>
-							<div class="col-sm-8">
-								<label for="s3_expiration">Link expiration(Seconds):</label>
-								  <input type="number" class="form-control" id="s3_expiration" name="s3_expiration" placeholder="Expiration (Default: 15s)">
 							<br><br>
 	  						 <button id="downloadbutton" class="btn btn-light" type="button" onclick="TestAWS(this);">
 			  					Test configuration
@@ -495,8 +491,8 @@
 			  				<input type="hidden" id="s3_region" name="s3_region" >
 			  				<input type="hidden" id="s3_api" name="s3_api">
 			  				<input type="hidden" id="s3_secret" name="s3_secret">
-			  				<input type="hidden" id="s3_endpoint" name="s3_endpoint">
 			  				<input type="hidden" id="s3_expiration" name="s3_expiration">
+			  				<input type="hidden" id="s3_endpoint" name="s3_endpoint">
 {{ end }}			
 							</div>
 						</div>
